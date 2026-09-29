@@ -2,7 +2,7 @@
 use soroban_sdk::xdr::ToXdr;
 use soroban_sdk::{
     contract, contractimpl, contracttype, symbol_short, token as soroban_token, Address, Bytes,
-    BytesN, Env, Symbol, Vec,
+    BytesN, Env, String, Symbol, Vec,
 };
 
 use pause_manager::PauseManagerClient;
@@ -22,6 +22,7 @@ use signed_operator_actions::{
 };
 
 const MAX_BATCH: u32 = 50;
+const MAX_DRAFT_DESCRIPTION_BYTES: u32 = 256;
 
 #[contract]
 pub struct Payroll;
@@ -1204,6 +1205,12 @@ impl Payroll {
         }
     }
 
+    fn require_period_not_frozen(e: &Env, period_label: &Symbol) {
+        if Self::is_period_config_frozen(e.clone(), period_label.clone()) {
+            panic!("Payroll period is frozen: it has been finalized and can no longer be edited");
+        }
+    }
+
     fn validate_draft_description(description: &String) {
         if description.is_empty() {
             panic!("Description cannot be blank");
@@ -1272,6 +1279,70 @@ impl Payroll {
         let normalized_str = core::str::from_utf8(&normalized[..bytes.len()])
             .expect("normalized asset symbol is valid UTF-8");
         Symbol::new(e, normalized_str)
+    }
+
+    /// Internal helper that normalizes an employee reference identifier (#544).
+    ///
+    /// Rules applied:
+    /// 1. Trims leading and trailing whitespace (spaces, tabs, newlines, carriage returns).
+    /// 2. Converts ASCII lowercase letters to uppercase for canonical matching.
+    /// 3. Validates length is between 1 and 256 characters after trimming.
+    /// 4. Validates that the identifier contains only printable ASCII characters (32..=126).
+    /// 5. Rejects empty or all-whitespace strings.
+    ///
+    /// Privacy-safe: operates strictly on opaque reference identifier strings without
+    /// exposing or logging salary amounts or cryptographic blinding factors.
+    fn normalize_employee_identifier_internal(e: &Env, identifier: &String) -> String {
+        let raw_len = identifier.len() as usize;
+        if raw_len == 0 || raw_len > 512 {
+            panic!("Reference ID must be 1-256 characters");
+        }
+
+        let mut buf = [0u8; 512];
+        identifier.copy_into_slice(&mut buf[..raw_len]);
+        let slice = &buf[..raw_len];
+
+        let mut start = 0;
+        while start < raw_len
+            && (slice[start] == b' '
+                || slice[start] == b'\t'
+                || slice[start] == b'\n'
+                || slice[start] == b'\r')
+        {
+            start += 1;
+        }
+
+        let mut end = raw_len;
+        while end > start
+            && (slice[end - 1] == b' '
+                || slice[end - 1] == b'\t'
+                || slice[end - 1] == b'\n'
+                || slice[end - 1] == b'\r')
+        {
+            end -= 1;
+        }
+
+        let trimmed_len = end - start;
+        if trimmed_len == 0 || trimmed_len > 256 {
+            panic!("Reference ID must be 1-256 characters");
+        }
+
+        let mut out_buf = [0u8; 256];
+        for i in 0..trimmed_len {
+            let b = slice[start + i];
+            if b < 32 || b > 126 {
+                panic!("Employee identifier contains invalid characters: must be printable ASCII");
+            }
+            out_buf[i] = if b.is_ascii_lowercase() {
+                b - 32
+            } else {
+                b
+            };
+        }
+
+        let normalized_str = core::str::from_utf8(&out_buf[..trimmed_len])
+            .expect("normalized employee identifier is valid UTF-8");
+        String::from_str(e, normalized_str)
     }
 
     /// Reject a payroll batch that lists the same employee wallet more than
@@ -4277,6 +4348,21 @@ impl Payroll {
         draft.updated_at
     }
 
+    /// Normalize an employee identifier according to standard rules (#544).
+    ///
+    /// Rules applied:
+    /// 1. Trims leading and trailing whitespace.
+    /// 2. Converts ASCII lowercase letters to uppercase for canonical matching.
+    /// 3. Validates length is between 1 and 256 characters after trimming.
+    /// 4. Validates that the identifier contains only printable ASCII characters (32..=126).
+    /// 5. Rejects empty or all-whitespace strings.
+    ///
+    /// Privacy-safe: operates strictly on opaque reference identifier strings without
+    /// exposing or logging salary amounts or cryptographic blinding factors.
+    pub fn normalize_employee_identifier(e: Env, identifier: String) -> String {
+        Self::normalize_employee_identifier_internal(&e, &identifier)
+    }
+
     /// Return whether a draft transition is allowed by the draft state machine.
     pub fn is_draft_transition_allowed(_e: Env, from: RunDraftState, to: RunDraftState) -> bool {
         Self::is_allowed_draft_state_transition_internal(from, to)
@@ -4333,23 +4419,9 @@ impl Payroll {
         // Issue #471: the period is now final — auto-freeze it so no further
         // payroll edits can slip in after submission without an explicit
         // authorized unfreeze.
-        let freeze_key = DataKey::PeriodFreeze(draft.period_label.clone());
+        let freeze_key = DataKey::PeriodConfigFrozen(draft.period_label.clone());
         if !e.storage().persistent().has(&freeze_key) {
-            let freeze = PeriodFreeze {
-                period_label: draft.period_label.clone(),
-                frozen_by: admin.clone(),
-                frozen_at: e.ledger().timestamp(),
-                reason: Symbol::new(&e, "finalized"),
-                runs_count: Self::count_runs_for_period(&e, &draft.period_label),
-            };
-            e.storage().persistent().set(&freeze_key, &freeze);
-
-            payroll_events::emit_period_frozen(
-                &e,
-                draft.period_label.clone(),
-                admin.clone(),
-                Symbol::new(&e, "finalized"),
-            );
+            e.storage().persistent().set(&freeze_key, &true);
         }
 
         payroll_events::emit_draft_submitted(&e, draft_id, admin);
@@ -7224,7 +7296,7 @@ impl Payroll {
     // ────────────────────────────────────────────────────────────────────────────
 
     /// Validate that a period is suitable for cloning/templating.
-    pub fn validate_period_for_cloning(e: Env, period: Symbol) -> Result<(), ()> {
+    pub fn validate_period_for_cloning(e: Env, period: Symbol) {
         Self::validate_symbol_not_empty(&e, &period, "period");
 
         // Check if period is frozen
@@ -7239,8 +7311,6 @@ impl Payroll {
         {
             panic!("Source period has no settlement window configured");
         }
-
-        Ok(())
     }
 
     // ────────────────────────────────────────────────────────────────────────────
@@ -7248,7 +7318,7 @@ impl Payroll {
     // ────────────────────────────────────────────────────────────────────────────
 
     /// Verify draft checksum matches between preparation and finalization.
-    pub fn verify_draft_checksum(e: &Env, run_id: u64, provided_hash: BytesN<32>) -> Result<(), ()> {
+    fn verify_draft_checksum(e: &Env, run_id: u64, provided_hash: BytesN<32>) {
         let pending_run: PendingPayrollRun = e
             .storage()
             .persistent()
@@ -7258,8 +7328,6 @@ impl Payroll {
         if pending_run.draft_hash != provided_hash {
             panic!("Draft checksum mismatch: payroll data was modified after review");
         }
-
-        Ok(())
     }
 }
 
@@ -11172,5 +11240,63 @@ mod tests {
             Payroll::normalize_asset_symbol(&env, "  USDC  "),
             allowlist_symbol
         );
+    }
+
+    // ── Issue #544: Employee identifier normalization tests ──────────────────
+
+    #[test]
+    fn test_employee_identifier_normalization_mixed_case_and_whitespace() {
+        let env = Env::default();
+        let (payroll_client, _admin, _treasury, _treasury_owner, _employee) =
+            setup_simple_payroll(&env);
+
+        let raw1 = String::from_str(&env, "  emp-1001 \t\n");
+        let expected1 = String::from_str(&env, "EMP-1001");
+        assert_eq!(
+            payroll_client.normalize_employee_identifier(&raw1),
+            expected1
+        );
+
+        let raw2 = String::from_str(&env, "emp_doe_john#42.dept/eng");
+        let expected2 = String::from_str(&env, "EMP_DOE_JOHN#42.DEPT/ENG");
+        assert_eq!(
+            payroll_client.normalize_employee_identifier(&raw2),
+            expected2
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "Reference ID must be 1-256 characters")]
+    fn test_employee_identifier_normalization_rejects_empty_or_whitespace() {
+        let env = Env::default();
+        let (payroll_client, _admin, _treasury, _treasury_owner, _employee) =
+            setup_simple_payroll(&env);
+
+        let blank = String::from_str(&env, "   \t \n ");
+        payroll_client.normalize_employee_identifier(&blank);
+    }
+
+    #[test]
+    #[should_panic(expected = "Reference ID must be 1-256 characters")]
+    fn test_employee_identifier_normalization_rejects_overlong() {
+        let env = Env::default();
+        let (payroll_client, _admin, _treasury, _treasury_owner, _employee) =
+            setup_simple_payroll(&env);
+
+        let mut long_str = [b'A'; 257];
+        let long = String::from_str(&env, core::str::from_utf8(&long_str).unwrap());
+        payroll_client.normalize_employee_identifier(&long);
+    }
+
+    #[test]
+    #[should_panic(expected = "Employee identifier contains invalid characters: must be printable ASCII")]
+    fn test_employee_identifier_normalization_rejects_non_printable() {
+        let env = Env::default();
+        let (payroll_client, _admin, _treasury, _treasury_owner, _employee) =
+            setup_simple_payroll(&env);
+
+        let bad_bytes = [b'E', b'M', b'P', 0x07, b'1']; // 0x07 is non-printable BEL
+        let bad = String::from_str(&env, core::str::from_utf8(&bad_bytes).unwrap());
+        payroll_client.normalize_employee_identifier(&bad);
     }
 }

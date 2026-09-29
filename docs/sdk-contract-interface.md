@@ -183,6 +183,22 @@ Register an employee with a private salary commitment.
 | `Inactive` (1) | Temporarily ineligible |
 | `Incomplete` (2) | Default; onboarding not finished |
 
+### Employee Reference Identifiers & Normalization Rules (#544)
+
+External HR reference identifiers (e.g. `"EMP-1001"`) map human-readable employee IDs to on-chain Stellar addresses without disclosing private salary figures or blinding factors.
+
+All employee reference IDs are canonically normalized according to strict validation and normalization rules:
+
+1. **Whitespace Trimming**: Leading and trailing ASCII whitespace (spaces, tabs `\t`, newlines `\n`, carriage returns `\r`) are automatically trimmed.
+2. **Canonical Uppercasing**: ASCII lowercase letters (`a`-`z`) are automatically converted to uppercase (`A`-`Z`) for deterministic cross-casing lookups and collision prevention.
+3. **Length Constraints**: Must be between 1 and 256 printable characters after trimming. Empty or all-whitespace strings are rejected.
+4. **Character Set Validation**: Only printable ASCII characters (`0x20` space through `0x7E` `~`) are permitted; control codes are rejected.
+
+**Key Entrypoints:**
+- `SalaryCommitmentContract::set_employee_reference_id(employee, reference_id)` — Sets or updates an employee's external reference ID. Enforces uniqueness across the employer scope using the normalized form.
+- `SalaryCommitmentContract::get_employee_by_reference_id(reference_id)` — Returns the `Option<Address>` for a given reference ID, normalizing the query input for case- and whitespace-insensitive lookups.
+- `SalaryCommitmentContract::normalize_employee_identifier(identifier)` / `Payroll::normalize_employee_identifier(identifier)` — Pure helper returning the canonical normalized `soroban_sdk::String`.
+
 ### Updating commitments
 
 When salary changes, use one of:

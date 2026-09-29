@@ -360,8 +360,141 @@ impl SalaryCommitmentContract {
         env.storage().persistent().has(&key)
     }
 
+    /// Normalize an employee reference identifier according to standard rules (#544).
+    ///
+    /// Rules applied:
+    /// 1. Trims leading and trailing whitespace (spaces, tabs, newlines, carriage returns).
+    /// 2. Converts ASCII lowercase letters to uppercase for canonical matching.
+    /// 3. Validates length is between 1 and 256 characters after trimming.
+    /// 4. Validates that the identifier contains only printable ASCII characters (32..=126).
+    /// 5. Rejects empty or all-whitespace strings.
+    ///
+    /// Privacy-safe: operates strictly on opaque reference identifier strings without
+    /// exposing or logging salary amounts or cryptographic blinding factors.
+    ///
+    /// # Panics
+    /// - Panics with `"Reference ID must be 1-256 characters"` if empty, all-whitespace, or > 256 chars.
+    /// - Panics with `"Employee identifier contains invalid characters: must be printable ASCII"` if non-printable.
+    pub fn normalize_employee_identifier(env: Env, identifier: soroban_sdk::String) -> soroban_sdk::String {
+        Self::normalize_employee_identifier_internal(&env, &identifier)
+    }
+
+    /// Internal helper that normalizes an employee reference identifier.
+    fn normalize_employee_identifier_internal(
+        env: &Env,
+        identifier: &soroban_sdk::String,
+    ) -> soroban_sdk::String {
+        let raw_len = identifier.len() as usize;
+        if raw_len == 0 || raw_len > 512 {
+            panic!("Reference ID must be 1-256 characters");
+        }
+
+        let mut buf = [0u8; 512];
+        identifier.copy_into_slice(&mut buf[..raw_len]);
+        let slice = &buf[..raw_len];
+
+        let mut start = 0;
+        while start < raw_len
+            && (slice[start] == b' '
+                || slice[start] == b'\t'
+                || slice[start] == b'\n'
+                || slice[start] == b'\r')
+        {
+            start += 1;
+        }
+
+        let mut end = raw_len;
+        while end > start
+            && (slice[end - 1] == b' '
+                || slice[end - 1] == b'\t'
+                || slice[end - 1] == b'\n'
+                || slice[end - 1] == b'\r')
+        {
+            end -= 1;
+        }
+
+        let trimmed_len = end - start;
+        if trimmed_len == 0 || trimmed_len > 256 {
+            panic!("Reference ID must be 1-256 characters");
+        }
+
+        let mut out_buf = [0u8; 256];
+        for i in 0..trimmed_len {
+            let b = slice[start + i];
+            if b < 32 || b > 126 {
+                panic!("Employee identifier contains invalid characters: must be printable ASCII");
+            }
+            out_buf[i] = if b.is_ascii_lowercase() {
+                b - 32
+            } else {
+                b
+            };
+        }
+
+        let normalized_str = core::str::from_utf8(&out_buf[..trimmed_len])
+            .expect("normalized employee identifier is valid UTF-8");
+        soroban_sdk::String::from_str(env, normalized_str)
+    }
+
+    /// Try normalizing an identifier for read-only lookups, returning None if invalid.
+    fn try_normalize_employee_identifier_internal(
+        env: &Env,
+        identifier: &soroban_sdk::String,
+    ) -> Option<soroban_sdk::String> {
+        let raw_len = identifier.len() as usize;
+        if raw_len == 0 || raw_len > 512 {
+            return None;
+        }
+
+        let mut buf = [0u8; 512];
+        identifier.copy_into_slice(&mut buf[..raw_len]);
+        let slice = &buf[..raw_len];
+
+        let mut start = 0;
+        while start < raw_len
+            && (slice[start] == b' '
+                || slice[start] == b'\t'
+                || slice[start] == b'\n'
+                || slice[start] == b'\r')
+        {
+            start += 1;
+        }
+
+        let mut end = raw_len;
+        while end > start
+            && (slice[end - 1] == b' '
+                || slice[end - 1] == b'\t'
+                || slice[end - 1] == b'\n'
+                || slice[end - 1] == b'\r')
+        {
+            end -= 1;
+        }
+
+        let trimmed_len = end - start;
+        if trimmed_len == 0 || trimmed_len > 256 {
+            return None;
+        }
+
+        let mut out_buf = [0u8; 256];
+        for i in 0..trimmed_len {
+            let b = slice[start + i];
+            if b < 32 || b > 126 {
+                return None;
+            }
+            out_buf[i] = if b.is_ascii_lowercase() {
+                b - 32
+            } else {
+                b
+            };
+        }
+
+        let normalized_str = core::str::from_utf8(&out_buf[..trimmed_len]).ok()?;
+        Some(soroban_sdk::String::from_str(env, normalized_str))
+    }
+
     /// Set an external reference ID (e.g., HR system employee ID) for an employee.
     /// Only the HR admin may call. Reference IDs must be unique (no collisions).
+    /// Applies employee identifier normalization rules (#544).
     /// Non-sensitive IDs only (e.g., "EMP12345", not salary or bank account).
     pub fn set_employee_reference_id(
         env: Env,
@@ -371,14 +504,11 @@ impl SalaryCommitmentContract {
         Self::require_not_paused(&env);
         Self::require_admin(&env);
 
-        // Validate reference ID is not empty and reasonable length (< 256 chars)
-        if reference_id.is_empty() || reference_id.len() > 256 {
-            panic!("Reference ID must be 1-256 characters");
-        }
+        let normalized_id = Self::normalize_employee_identifier_internal(&env, &reference_id);
 
         // Check if this reference ID is already assigned to a different employee
         // in this employer's salary commitment contract (the payroll scope).
-        let index_key = DataKey::ReferenceIdIndex(reference_id.clone());
+        let index_key = DataKey::ReferenceIdIndex(normalized_id.clone());
         if let Some(existing_employee) = env
             .storage()
             .persistent()
@@ -396,7 +526,7 @@ impl SalaryCommitmentContract {
             .persistent()
             .get::<DataKey, soroban_sdk::String>(&employee_key)
         {
-            if old_ref_id != reference_id {
+            if old_ref_id != normalized_id {
                 // Remove old reverse mapping
                 env.storage()
                     .persistent()
@@ -404,11 +534,11 @@ impl SalaryCommitmentContract {
             }
         }
 
-        // Store both forward and reverse mappings
-        env.storage().persistent().set(&employee_key, &reference_id);
+        // Store both forward and reverse mappings using canonical normalized form
+        env.storage().persistent().set(&employee_key, &normalized_id);
         env.storage().persistent().set(&index_key, &employee);
 
-        payroll_events::emit_reference_id_set(&env, employee, reference_id);
+        payroll_events::emit_reference_id_set(&env, employee, normalized_id);
     }
 
     /// Get the external reference ID for an employee (if set).
@@ -418,15 +548,14 @@ impl SalaryCommitmentContract {
     }
 
     /// Get the employee address associated with a reference ID (for lookups).
-    /// Returns None if no employee is associated with this ID.
+    /// Normalizes the lookup identifier so mixed-case or padded queries resolve (#544).
+    /// Returns None if no employee is associated with this ID or if invalid.
     pub fn get_employee_by_reference_id(
         env: Env,
         reference_id: soroban_sdk::String,
     ) -> Option<Address> {
-        if reference_id.is_empty() || reference_id.len() > 256 {
-            return None;
-        }
-        let key = DataKey::ReferenceIdIndex(reference_id);
+        let normalized_id = Self::try_normalize_employee_identifier_internal(&env, &reference_id)?;
+        let key = DataKey::ReferenceIdIndex(normalized_id);
         env.storage().persistent().get(&key)
     }
 

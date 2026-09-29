@@ -10,6 +10,7 @@ ZK Payroll Contracts enable companies to process payroll on-chain while keeping 
 
 - **Private Salary Commitments** — Salary amounts stored as ZK commitments
 - **Proof-Based Payments** — Verify payments without exposing values
+- **Employee Identifier Normalization** — Canonical trimming, ASCII uppercasing, and validation for safe HR reference lookups and collision prevention
 - **Batch Payroll** — Process multiple employees in single transaction
 - **Period Freeze Guard** — Finalized payroll periods are locked against further edits, with an admin-controlled unfreeze path for authorized corrections
 - **Run Expiration** — Prepared-but-unfinalized payroll runs can expire after a configurable window, releasing reserved funds and stopping stale submissions
