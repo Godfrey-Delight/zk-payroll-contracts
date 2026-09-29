@@ -242,6 +242,8 @@ Drafts let you correct totals before committing on-chain.
 | `Payroll::create_run_draft` | Create a `Pending` draft with expected totals |
 | `Payroll::amend_run_draft` | Correct amounts/employee count before finalizing |
 | `Payroll::finalize_run_draft` | Lock the draft (immutable) |
+| `Payroll::get_draft_lock_owner` | Query the lock owner address of a finalized/locked draft (#556) |
+| `Payroll::get_draft_updated_at` | Query draft last-updated timestamp metadata |
 
 **Sample: `create_run_draft`**
 

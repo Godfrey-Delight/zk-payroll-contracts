@@ -524,6 +524,12 @@ pub fn emit_period_closed(e: &Env, company_id: u64, period_id: u32) {
         .publish((Symbol::new(e, "PeriodClosed"), company_id), (period_id,));
 }
 
+/// Emitted when a closed payroll period is reopened for a company.
+pub fn emit_period_reopened(e: &Env, company_id: u64, period_id: u32) {
+    e.events()
+        .publish((Symbol::new(e, "PeriodReopened"), company_id), (period_id,));
+}
+
 /// Emitted when a single payment is executed in the payment executor.
 pub fn emit_executor_payment_processed(
     e: &Env,
@@ -554,6 +560,28 @@ pub fn emit_withholding_config_set(e: &Env, company_id: u64, actor: Address) {
 pub fn emit_asset_allowed_changed(e: &Env, asset: Address, allowed: bool) {
     e.events()
         .publish((Symbol::new(e, "AssetAllowedChanged"),), (asset, allowed));
+}
+
+/// Emitted when the minimum payout amount threshold is set or updated (issue #514).
+///
+/// The event contains only the threshold value and timestamp; it does not expose
+/// individual payroll amounts or employee data.
+pub fn emit_minimum_payout_amount_set(e: &Env, minimum_amount: i128) {
+    e.events().publish(
+        (payroll_topic(), Symbol::new(e, "min_payout_set")),
+        (minimum_amount, e.ledger().timestamp()),
+    );
+}
+
+/// Emitted when a payroll batch violates the minimum payout amount threshold (issue #514).
+///
+/// The event contains only the threshold value; it does not expose the actual
+/// payout amounts or employee data.
+pub fn emit_minimum_payout_amount_violation(e: &Env, minimum_amount: i128) {
+    e.events().publish(
+        (payroll_topic(), Symbol::new(e, "min_payout_violation")),
+        (minimum_amount,),
+    );
 }
 
 // ═════════════════════════════════════════════════════════════════════════════
@@ -828,6 +856,26 @@ pub fn emit_draft_expired(e: &Env, draft_id: u64, admin: Address) {
     e.events().publish(
         (payroll_topic(), Symbol::new(e, "draft_expired")),
         (draft_id, admin),
+    );
+}
+
+/// Emitted when a payroll period is frozen (#471).
+///
+/// `reason` is a short operator-supplied label (e.g. `finalized` when the
+/// freeze was applied automatically by `submit_run_draft`). No salary values
+/// or per-employee data are ever included in this event.
+pub fn emit_period_frozen(e: &Env, period_label: Symbol, frozen_by: Address, reason: Symbol) {
+    e.events().publish(
+        (payroll_topic(), Symbol::new(e, "period_frozen")),
+        (period_label, frozen_by, reason),
+    );
+}
+
+/// Emitted when a payroll period freeze is lifted (#471).
+pub fn emit_period_unfrozen(e: &Env, period_label: Symbol, unfrozen_by: Address) {
+    e.events().publish(
+        (payroll_topic(), Symbol::new(e, "period_unfrozen")),
+        (period_label, unfrozen_by),
     );
 }
 
@@ -1335,5 +1383,64 @@ pub fn emit_interrupted_run_recovered(
             resumed_checkpoint_index,
             total_checkpoints,
         ),
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Cross-asset treasury isolation events (#317)
+// ---------------------------------------------------------------------------
+
+/// Emitted once when a `treasury_isolation` contract instance is initialized.
+pub fn emit_treasury_isolation_initialized(e: &Env, admin: Address) {
+    e.events()
+        .publish((payroll_topic(), Symbol::new(e, "treas_iso_init")), admin);
+}
+
+/// Emitted when a new asset is registered for a company's treasury.
+pub fn emit_treasury_asset_registered(
+    e: &Env,
+    company_id: u64,
+    asset: Address,
+    issuer: Address,
+    symbol: Symbol,
+) {
+    e.events().publish(
+        (payroll_topic(), Symbol::new(e, "treas_asset_reg")),
+        (company_id, asset, issuer, symbol),
+    );
+}
+
+/// Emitted when a company's (company, asset) balance is credited.
+pub fn emit_treasury_credited(e: &Env, company_id: u64, asset: Address, amount: i128) {
+    e.events().publish(
+        (payroll_topic(), Symbol::new(e, "treas_credited")),
+        (company_id, asset, amount),
+    );
+}
+
+/// Emitted when an amount is reserved against a (company, asset) balance for
+/// an in-flight payroll batch.
+pub fn emit_treasury_reserved(e: &Env, company_id: u64, asset: Address, amount: i128) {
+    e.events().publish(
+        (payroll_topic(), Symbol::new(e, "treas_reserved")),
+        (company_id, asset, amount),
+    );
+}
+
+/// Emitted when a previously reserved amount is released back to available
+/// balance (e.g. batch cancellation).
+pub fn emit_treasury_reserve_released(e: &Env, company_id: u64, asset: Address, amount: i128) {
+    e.events().publish(
+        (payroll_topic(), Symbol::new(e, "treas_reserve_rel")),
+        (company_id, asset, amount),
+    );
+}
+
+/// Emitted when a (company, asset) balance is debited on successful batch
+/// execution.
+pub fn emit_treasury_debited(e: &Env, company_id: u64, asset: Address, amount: i128) {
+    e.events().publish(
+        (payroll_topic(), Symbol::new(e, "treas_debited")),
+        (company_id, asset, amount),
     );
 }
