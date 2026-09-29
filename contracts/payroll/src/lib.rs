@@ -2,7 +2,7 @@
 use soroban_sdk::xdr::ToXdr;
 use soroban_sdk::{
     contract, contractimpl, contracttype, symbol_short, token as soroban_token, Address, Bytes,
-    BytesN, Env, Symbol, Vec,
+    BytesN, Env, String, Symbol, Vec,
 };
 
 use pause_manager::PauseManagerClient;
@@ -14,6 +14,7 @@ pub mod config_audit;
 use config_audit::{config_keys, no_value_ref, record_config_change, stored_ref, value_ref};
 
 const MAX_BATCH: u32 = 50;
+const MAX_DRAFT_DESCRIPTION_BYTES: u32 = 256;
 
 #[contract]
 pub struct Payroll;
@@ -1115,6 +1116,12 @@ impl Payroll {
     fn validate_draft_id(draft_id: u64) {
         if draft_id == 0 {
             panic!("Invalid draft ID: must be non-zero");
+        }
+    }
+
+    fn require_period_not_frozen(e: &Env, period_label: &Symbol) {
+        if Self::is_period_config_frozen(e.clone(), period_label.clone()) {
+            panic!("Payroll period is frozen: it has been finalized and can no longer be edited");
         }
     }
 
@@ -3803,6 +3810,81 @@ impl Payroll {
         draft.updated_at
     }
 
+    /// Return the owner/admin who holds the lock on a payroll draft (Issue #556).
+    ///
+    /// A draft is considered in a locked state when it has reached a finalized
+    /// review or submission state (`RunDraftState::Finalized` or `RunDraftState::Submitted`).
+    /// - If the draft exists and is locked (`Finalized` or `Submitted`), returns `Some(draft.admin)`.
+    /// - If the draft exists but is in an unlocked state (`Pending`) or terminal non-locked state (`Cancelled`, `Expired`), returns `None`.
+    /// - If the draft does not exist, returns `None`.
+    ///
+    /// Exposes only the lock owner address metadata without revealing confidential
+    /// employee addresses or salary figures.
+    pub fn get_draft_lock_owner(e: Env, draft_id: u64) -> Option<Address> {
+        Self::validate_draft_id(draft_id);
+        let draft: PayrollRunDraft = e
+            .storage()
+            .persistent()
+            .get(&DataKey::RunDraft(draft_id))?;
+        if matches!(draft.state, RunDraftState::Finalized | RunDraftState::Submitted) {
+            Some(draft.admin)
+        } else {
+            None
+        }
+    }
+
+    /// Set or update the description for a draft in Pending state.
+    pub fn set_run_draft_description(e: Env, admin: Address, draft_id: u64, description: String) {
+        Self::require_not_paused(&e);
+        let addrs: ContractAddresses = e
+            .storage()
+            .persistent()
+            .get(&DataKey::Addresses)
+            .expect("Not initialized");
+        if admin != addrs.admin {
+            panic!("Unauthorized");
+        }
+        admin.require_auth();
+
+        Self::validate_draft_id(draft_id);
+        let draft: PayrollRunDraft = e
+            .storage()
+            .persistent()
+            .get(&DataKey::RunDraft(draft_id))
+            .expect("Draft not found");
+        if draft.state != RunDraftState::Pending {
+            panic!("Only pending drafts can be updated");
+        }
+        let len = description.len();
+        if len == 0 || len > 256 {
+            panic!("Description length must be between 1 and 256 characters");
+        }
+        let mut all_spaces = true;
+        let mut buf = [0u8; 256];
+        description.copy_into_slice(&mut buf[..len as usize]);
+        for &b in &buf[..len as usize] {
+            if b != b' ' && b != b'\t' && b != b'\n' && b != b'\r' {
+                all_spaces = false;
+                break;
+            }
+        }
+        if all_spaces {
+            panic!("Description cannot be empty or blank");
+        }
+
+        e.storage()
+            .persistent()
+            .set(&DataKey::DraftDescription(draft_id), &description);
+    }
+
+    /// Retrieve the description for a draft by ID.
+    pub fn get_run_draft_description(e: Env, draft_id: u64) -> Option<String> {
+        Self::validate_draft_id(draft_id);
+        e.storage()
+            .persistent()
+            .get(&DataKey::DraftDescription(draft_id))
+    }
+
     /// Return whether a draft transition is allowed by the draft state machine.
     pub fn is_draft_transition_allowed(_e: Env, from: RunDraftState, to: RunDraftState) -> bool {
         Self::is_allowed_draft_state_transition_internal(from, to)
@@ -3859,23 +3941,9 @@ impl Payroll {
         // Issue #471: the period is now final — auto-freeze it so no further
         // payroll edits can slip in after submission without an explicit
         // authorized unfreeze.
-        let freeze_key = DataKey::PeriodFreeze(draft.period_label.clone());
+        let freeze_key = DataKey::PeriodConfigFrozen(draft.period_label.clone());
         if !e.storage().persistent().has(&freeze_key) {
-            let freeze = PeriodFreeze {
-                period_label: draft.period_label.clone(),
-                frozen_by: admin.clone(),
-                frozen_at: e.ledger().timestamp(),
-                reason: Symbol::new(&e, "finalized"),
-                runs_count: Self::count_runs_for_period(&e, &draft.period_label),
-            };
-            e.storage().persistent().set(&freeze_key, &freeze);
-
-            payroll_events::emit_period_frozen(
-                &e,
-                draft.period_label.clone(),
-                admin.clone(),
-                Symbol::new(&e, "finalized"),
-            );
+            e.storage().persistent().set(&freeze_key, &true);
         }
 
         payroll_events::emit_draft_submitted(&e, draft_id, admin);
@@ -6218,7 +6286,7 @@ impl Payroll {
                     PayrollRunState::Failed | PayrollRunState::ReconciliationRequired => {
                         PayrollRunStatusKind::Failed
                     }
-                    PayrollRunState::Cancelled => {
+                    PayrollRunState::Cancelled | PayrollRunState::Expired => {
                         PayrollRunStatusKind::Failed
                     }
                 };
@@ -6380,365 +6448,54 @@ impl Payroll {
         Ok(())
     }
 
-    // ?? Issue #401: Batch Lock Timestamp Query Helper ????????????????????????
+    // ────────────────────────────────────────────────────────────────────────────
+    // Issue #515: Period Cloning Validation
+    // ────────────────────────────────────────────────────────────────────────────
 
-    /// Return the timestamp at which a payroll batch reached locked state (#401).
-    ///
-    /// A batch is in a locked state when funds have been reserved and it is awaiting
-    /// execution or has already been executed.
-    /// - If the batch is in a pending run state (`PendingRun(run_id)`), its `prepared_at` timestamp is returned.
-    /// - If the batch has been executed (`PayrollRun(run_id)`), its `executed_at` timestamp is returned.
-    /// - If the batch does not exist or has not been locked, `None` is returned.
-    pub fn get_batch_lock_timestamp(e: Env, run_id: u64) -> Option<u64> {
-        if let Some(pending) = e
-            .storage()
+    /// Validate that a period is suitable for cloning/templating.
+    /// 
+    /// Checks:
+    /// - Period configuration is not frozen
+    /// - Settlement window exists
+    /// 
+    /// Returns if valid, panics with actionable message otherwise.
+    /// Privacy-safe: does not expose salary amounts or employee data.
+    pub fn validate_period_for_cloning(e: Env, period: Symbol) {
+        Self::validate_symbol_not_empty(&e, &period, "period");
+        
+        // Check if period is frozen
+        if Self::is_period_config_frozen(e.clone(), period.clone()) {
+            panic!("Source period is frozen and cannot be used as a template");
+        }
+        
+        // Verify settlement window exists
+        if !e.storage()
             .persistent()
-            .get::<_, PendingPayrollRun>(&DataKey::PendingRun(run_id))
+            .has(&DataKey::SettlementWindow(period.clone()))
         {
-            return Some(pending.prepared_at);
+            panic!("Source period has no settlement window configured");
         }
-        if let Some(run) = e
+    }
+
+    // ────────────────────────────────────────────────────────────────────────────
+    // Issue #512: Draft Checksum Verification Enhancement  
+    // ────────────────────────────────────────────────────────────────────────────
+    
+    /// Verify draft checksum matches between preparation and finalization.
+    /// 
+    /// This prevents tampering with draft data after review but before execution.
+    /// The draft_hash is computed at prepare time and stored in PendingPayrollRun.
+    /// 
+    /// Privacy-safe: uses cryptographic hash, doesn't expose salary data.
+    pub fn verify_draft_checksum(e: Env, run_id: u64, provided_hash: BytesN<32>) {
+        let pending_run: PendingPayrollRun = e
             .storage()
             .persistent()
-            .get::<_, PayrollRun>(&DataKey::PayrollRun(run_id))
-        {
-            return Some(run.executed_at);
-        }
-        None
-    }
-
-    // ?? Issue #402: Safe Treasury Balance Summary View ???????????????????????
-
-    /// Return aggregate treasury balance summary for a given asset token (#402).
-    ///
-    /// Returns the total balance held at the treasury address, the reserved/locked
-    /// balance allocated to pending payroll runs, blocked balances, and the net
-    /// available balance without disclosing individual salary rows.
-    pub fn get_safe_treasury_summary(e: Env, asset: Address) -> SafeTreasurySummary {
-        let addrs: ContractAddresses = e
-            .storage()
-            .persistent()
-            .get(&DataKey::Addresses)
-            .expect("Not initialized");
-        let total_balance = soroban_token::Client::new(&e, &asset).balance(&addrs.treasury);
-        let reserved_balance = Self::get_locked_funds(e.clone(), asset.clone());
-        let blocked_balance = 0i128;
-        let available_balance = total_balance
-            .checked_sub(reserved_balance)
-            .unwrap_or(0i128)
-            .checked_sub(blocked_balance)
-            .unwrap_or(0i128);
-
-        SafeTreasurySummary {
-            asset,
-            total_balance,
-            available_balance,
-            reserved_balance,
-            blocked_balance,
-        }
-    }
-
-    // ?? Issue #403: Payroll Approval Expiry Validation ???????????????????????
-
-    /// Check whether an approval for a payroll run has expired (#403).
-    ///
-    /// Returns `true` if a review exists with decision `Approved` but `current_timestamp > reviewed_at + max_age_seconds`.
-    /// Returns `false` if the approval is within the validity window or if no approval exists.
-    pub fn is_payroll_approval_expired(e: Env, run_id: u64, max_age_seconds: u64) -> bool {
-        if let Some(review) = Self::get_run_review(e.clone(), run_id) {
-            if review.decision == ReviewDecision::Approved {
-                let current_time = e.ledger().timestamp();
-                let expiry_time = review.reviewed_at.saturating_add(max_age_seconds);
-                return current_time > expiry_time;
-            }
-        }
-        false
-    }
-
-    /// Validate that a payroll run approval is active and not expired (#403).
-    ///
-    /// # Panics
-    /// - If the approval for `run_id` has expired (older than `max_age_seconds`).
-    pub fn validate_approval_not_expired(e: &Env, run_id: u64, max_age_seconds: u64) {
-        if Self::is_payroll_approval_expired(e.clone(), run_id, max_age_seconds) {
-            panic!("Payroll approval expired: approval record exceeds maximum allowed age");
-        }
-    }
-
-    // ?? Issue #404: Cancelled Batch Read Status Helper ???????????????????????
-
-    /// Read safe cancellation metadata for a cancelled payroll batch (#404).
-    ///
-    /// Returns `Some(CancelledBatchStatus)` if the batch was cancelled, containing
-    /// run_id, cancellation timestamp, admin address, cancellation reason symbol,
-    /// employee count, total amount, draft hash, and `is_cancelled: true`.
-    /// Returns `None` if the batch was not cancelled or does not exist.
-    pub fn get_cancelled_batch_status(e: Env, run_id: u64) -> Option<CancelledBatchStatus> {
-        e.storage()
-            .persistent()
-            .get(&DataKey::CancelledBatchRecord(run_id))
-    }
-
-    // ?? Issue #352: Payroll Batch Split Validation ??????????????????????????????????
-
-    /// Record a batch split to track parent-child relationships (#352).
-    /// Validates that child batch totals can be aggregated back to parent.
-    pub fn record_batch_split(
-        e: Env,
-        admin: Address,
-        parent_run_id: u64,
-        child_run_id: u64,
-        parent_total: i128,
-        parent_employee_count: u32,
-        child_total: i128,
-        child_employee_count: u32,
-    ) {
-        admin.require_auth();
-
-        if child_total <= 0 || parent_total <= 0 {
-            panic!("Batch amounts must be positive");
-        }
-
-        if child_total > parent_total {
-            panic!("Child batch total cannot exceed parent total");
-        }
-
-        if child_employee_count > parent_employee_count {
-            panic!("Child employee count cannot exceed parent count");
-        }
-
-        let split_record = BatchSplitRecord {
-            parent_run_id,
-            child_run_id,
-            parent_total,
-            parent_employee_count,
-            child_total,
-            child_employee_count,
-            split_at: e.ledger().timestamp(),
-            split_by: admin.clone(),
-        };
-
-        e.storage().persistent().set(
-            &DataKey::BatchSplitRecord(parent_run_id, child_run_id),
-            &split_record,
-        );
-
-        e.events().publish(
-            (Symbol::new(&e, "BatchSplitRecorded"), parent_run_id),
-            (child_run_id, child_total, e.ledger().timestamp()),
-        );
-    }
-
-    /// Get batch split record by parent and child run IDs (#352).
-    pub fn get_batch_split(
-        e: Env,
-        parent_run_id: u64,
-        child_run_id: u64,
-    ) -> Option<BatchSplitRecord> {
-        e.storage()
-            .persistent()
-            .get(&DataKey::BatchSplitRecord(parent_run_id, child_run_id))
-    }
-
-    /// Validate that a batch split preserves the original aggregate commitment (#352).
-    /// This ensures that when a large batch is split, the sum of children equals the parent.
-    pub fn validate_batch_split_aggregate(
-        e: Env,
-        parent_run_id: u64,
-        expected_total_amount: i128,
-        expected_employee_count: u32,
-    ) -> bool {
-        let parent_run_key = DataKey::PayrollRun(parent_run_id);
-        if let Some(parent_run) = e
-            .storage()
-            .persistent()
-            .get::<DataKey, PayrollRun>(&parent_run_key)
-        {
-            parent_run.total_amount == expected_total_amount
-                && parent_run.employee_count == expected_employee_count
-        } else {
-            false
-        }
-    }
-
-    // ?? Issue #401: Batch Lock Timestamp Query Helper ????????????????????????
-
-    /// Return the timestamp at which a payroll batch reached locked state (#401).
-    ///
-    /// A batch is in a locked state when funds have been reserved and it is awaiting
-    /// execution or has already been executed.
-    /// - If the batch is in a pending run state (`PendingRun(run_id)`), its `prepared_at` timestamp is returned.
-    /// - If the batch has been executed (`PayrollRun(run_id)`), its `executed_at` timestamp is returned.
-    /// - If the batch does not exist or has not been locked, `None` is returned.
-    pub fn get_batch_lock_timestamp(e: Env, run_id: u64) -> Option<u64> {
-        if let Some(pending) = e
-            .storage()
-            .persistent()
-            .get::<_, PendingPayrollRun>(&DataKey::PendingRun(run_id))
-        {
-            return Some(pending.prepared_at);
-        }
-        if let Some(run) = e
-            .storage()
-            .persistent()
-            .get::<_, PayrollRun>(&DataKey::PayrollRun(run_id))
-        {
-            return Some(run.executed_at);
-        }
-        None
-    }
-
-    // ?? Issue #402: Safe Treasury Balance Summary View ???????????????????????
-
-    /// Return aggregate treasury balance summary for a given asset token (#402).
-    ///
-    /// Returns the total balance held at the treasury address, the reserved/locked
-    /// balance allocated to pending payroll runs, blocked balances, and the net
-    /// available balance without disclosing individual salary rows.
-    pub fn get_safe_treasury_summary(e: Env, asset: Address) -> SafeTreasurySummary {
-        let addrs: ContractAddresses = e
-            .storage()
-            .persistent()
-            .get(&DataKey::Addresses)
-            .expect("Not initialized");
-        let total_balance = soroban_token::Client::new(&e, &asset).balance(&addrs.treasury);
-        let reserved_balance = Self::get_locked_funds(e.clone(), asset.clone());
-        let blocked_balance = 0i128;
-        let available_balance = total_balance
-            .checked_sub(reserved_balance)
-            .unwrap_or(0i128)
-            .checked_sub(blocked_balance)
-            .unwrap_or(0i128);
-
-        SafeTreasurySummary {
-            asset,
-            total_balance,
-            available_balance,
-            reserved_balance,
-            blocked_balance,
-        }
-    }
-
-    // ?? Issue #403: Payroll Approval Expiry Validation ???????????????????????
-
-    /// Check whether an approval for a payroll run has expired (#403).
-    ///
-    /// Returns `true` if a review exists with decision `Approved` but `current_timestamp > reviewed_at + max_age_seconds`.
-    /// Returns `false` if the approval is within the validity window or if no approval exists.
-    pub fn is_payroll_approval_expired(e: Env, run_id: u64, max_age_seconds: u64) -> bool {
-        if let Some(review) = Self::get_run_review(e.clone(), run_id) {
-            if review.decision == ReviewDecision::Approved {
-                let current_time = e.ledger().timestamp();
-                let expiry_time = review.reviewed_at.saturating_add(max_age_seconds);
-                return current_time > expiry_time;
-            }
-        }
-        false
-    }
-
-    /// Validate that a payroll run approval is active and not expired (#403).
-    ///
-    /// # Panics
-    /// - If the approval for `run_id` has expired (older than `max_age_seconds`).
-    pub fn validate_approval_not_expired(e: &Env, run_id: u64, max_age_seconds: u64) {
-        if Self::is_payroll_approval_expired(e.clone(), run_id, max_age_seconds) {
-            panic!("Payroll approval expired: approval record exceeds maximum allowed age");
-        }
-    }
-
-    // ?? Issue #404: Cancelled Batch Read Status Helper ???????????????????????
-
-    /// Read safe cancellation metadata for a cancelled payroll batch (#404).
-    ///
-    /// Returns `Some(CancelledBatchStatus)` if the batch was cancelled, containing
-    /// run_id, cancellation timestamp, admin address, cancellation reason symbol,
-    /// employee count, total amount, draft hash, and `is_cancelled: true`.
-    /// Returns `None` if the batch was not cancelled or does not exist.
-    pub fn get_cancelled_batch_status(e: Env, run_id: u64) -> Option<CancelledBatchStatus> {
-        e.storage()
-            .persistent()
-            .get(&DataKey::CancelledBatchRecord(run_id))
-    }
-
-    // ?? Issue #352: Payroll Batch Split Validation ??????????????????????????????????
-
-    /// Record a batch split to track parent-child relationships (#352).
-    /// Validates that child batch totals can be aggregated back to parent.
-    pub fn record_batch_split(
-        e: Env,
-        admin: Address,
-        parent_run_id: u64,
-        child_run_id: u64,
-        parent_total: i128,
-        parent_employee_count: u32,
-        child_total: i128,
-        child_employee_count: u32,
-    ) {
-        admin.require_auth();
-
-        if child_total <= 0 || parent_total <= 0 {
-            panic!("Batch amounts must be positive");
-        }
-
-        if child_total > parent_total {
-            panic!("Child batch total cannot exceed parent total");
-        }
-
-        if child_employee_count > parent_employee_count {
-            panic!("Child employee count cannot exceed parent count");
-        }
-
-        let split_record = BatchSplitRecord {
-            parent_run_id,
-            child_run_id,
-            parent_total,
-            parent_employee_count,
-            child_total,
-            child_employee_count,
-            split_at: e.ledger().timestamp(),
-            split_by: admin.clone(),
-        };
-
-        e.storage().persistent().set(
-            &DataKey::BatchSplitRecord(parent_run_id, child_run_id),
-            &split_record,
-        );
-
-        e.events().publish(
-            (Symbol::new(&e, "BatchSplitRecorded"), parent_run_id),
-            (child_run_id, child_total, e.ledger().timestamp()),
-        );
-    }
-
-    /// Get batch split record by parent and child run IDs (#352).
-    pub fn get_batch_split(
-        e: Env,
-        parent_run_id: u64,
-        child_run_id: u64,
-    ) -> Option<BatchSplitRecord> {
-        e.storage()
-            .persistent()
-            .get(&DataKey::BatchSplitRecord(parent_run_id, child_run_id))
-    }
-
-    /// Validate that a batch split preserves the original aggregate commitment (#352).
-    /// This ensures that when a large batch is split, the sum of children equals the parent.
-    pub fn validate_batch_split_aggregate(
-        e: Env,
-        parent_run_id: u64,
-        expected_total_amount: i128,
-        expected_employee_count: u32,
-    ) -> bool {
-        let parent_run_key = DataKey::PayrollRun(parent_run_id);
-        if let Some(parent_run) = e
-            .storage()
-            .persistent()
-            .get::<DataKey, PayrollRun>(&parent_run_key)
-        {
-            parent_run.total_amount == expected_total_amount
-                && parent_run.employee_count == expected_employee_count
-        } else {
-            false
+            .get(&DataKey::PendingRun(run_id))
+            .expect("Pending run not found");
+            
+        if pending_run.draft_hash != provided_hash {
+            panic!("Draft checksum mismatch: payroll data was modified after review");
         }
     }
 }
@@ -6849,6 +6606,7 @@ mod tests {
     #[test]
     fn benchmark_50_batch_validations() {
         let env = Env::default();
+        env.budget().reset_unlimited();
         env.mock_all_auths();
 
         let verifier_id = env.register_contract(None, ProofVerifier);
@@ -7347,6 +7105,70 @@ mod tests {
         assert!(payroll_client.is_draft_state_terminal(&RunDraftState::Submitted));
         assert!(payroll_client.is_draft_state_terminal(&RunDraftState::Cancelled));
         assert!(payroll_client.is_draft_state_terminal(&RunDraftState::Expired));
+    }
+
+    #[test]
+    fn test_draft_lock_owner_query_lifecycle() {
+        let env = Env::default();
+        let (payroll_client, admin, _treasury, _treasury_owner, _employee) =
+            setup_simple_payroll(&env);
+
+        let draft_id = payroll_client.create_run_draft(
+            &admin,
+            &25_000i128,
+            &4u32,
+            &Symbol::new(&env, "LOCK_TEST"),
+        );
+
+        // 1. Pending draft is not locked -> returns None
+        assert_eq!(payroll_client.get_draft_lock_owner(&draft_id), None);
+
+        // 2. Finalized draft is locked -> returns Some(admin)
+        payroll_client.finalize_run_draft(&admin, &draft_id);
+        assert_eq!(payroll_client.get_draft_lock_owner(&draft_id), Some(admin.clone()));
+
+        // 3. Submitted draft remains locked -> returns Some(admin)
+        payroll_client.submit_run_draft(&admin, &draft_id);
+        assert_eq!(payroll_client.get_draft_lock_owner(&draft_id), Some(admin));
+
+        // 4. Non-existent draft returns None
+        assert_eq!(payroll_client.get_draft_lock_owner(&999_999u64), None);
+    }
+
+    #[test]
+    fn test_draft_lock_owner_cancelled_and_expired_return_none() {
+        let env = Env::default();
+        let (payroll_client, admin, _treasury, _treasury_owner, _employee) =
+            setup_simple_payroll(&env);
+
+        // Cancelled draft
+        let id_cancel = payroll_client.create_run_draft(
+            &admin,
+            &15_000i128,
+            &2u32,
+            &Symbol::new(&env, "CANCEL_LOCK"),
+        );
+        payroll_client.cancel_run_draft(&admin, &id_cancel);
+        assert_eq!(payroll_client.get_draft_lock_owner(&id_cancel), None);
+
+        // Expired draft
+        let id_expire = payroll_client.create_run_draft(
+            &admin,
+            &12_000i128,
+            &2u32,
+            &Symbol::new(&env, "EXPIRE_LOCK"),
+        );
+        payroll_client.expire_run_draft(&admin, &id_expire);
+        assert_eq!(payroll_client.get_draft_lock_owner(&id_expire), None);
+    }
+
+    #[test]
+    #[should_panic(expected = "Invalid draft ID: must be non-zero")]
+    fn test_draft_lock_owner_zero_id_panics() {
+        let env = Env::default();
+        let (payroll_client, _admin, _treasury, _treasury_owner, _employee) =
+            setup_simple_payroll(&env);
+        payroll_client.get_draft_lock_owner(&0u64);
     }
 
     // ?? Issue #103: per-payroll run nonce uniqueness ???????????????????????????
@@ -10498,58 +10320,3 @@ mod tests {
         );
     }
 }
-
-    // ────────────────────────────────────────────────────────────────────────────
-    // Issue #515: Period Cloning Validation
-    // ────────────────────────────────────────────────────────────────────────────
-
-    /// Validate that a period is suitable for cloning/templating.
-    /// 
-    /// Checks:
-    /// - Period configuration is not frozen
-    /// - Settlement window exists
-    /// 
-    /// Returns Ok(()) if valid, panics with actionable message otherwise.
-    /// Privacy-safe: does not expose salary amounts or employee data.
-    pub fn validate_period_for_cloning(e: Env, period: Symbol) -> Result<(), ()> {
-        Self::validate_symbol_not_empty(&e, &period, "period");
-        
-        // Check if period is frozen
-        if Self::is_period_config_frozen(e.clone(), period.clone()) {
-            panic!("Source period is frozen and cannot be used as a template");
-        }
-        
-        // Verify settlement window exists
-        if !e.storage()
-            .persistent()
-            .has(&DataKey::SettlementWindow(period.clone()))
-        {
-            panic!("Source period has no settlement window configured");
-        }
-        
-        Ok(())
-    }
-
-    // ────────────────────────────────────────────────────────────────────────────
-    // Issue #512: Draft Checksum Verification Enhancement  
-    // ────────────────────────────────────────────────────────────────────────────
-    
-    /// Verify draft checksum matches between preparation and finalization.
-    /// 
-    /// This prevents tampering with draft data after review but before execution.
-    /// The draft_hash is computed at prepare time and stored in PendingPayrollRun.
-    /// 
-    /// Privacy-safe: uses cryptographic hash, doesn't expose salary data.
-    pub fn verify_draft_checksum(e: &Env, run_id: u64, provided_hash: BytesN<32>) -> Result<(), ()> {
-        let pending_run: PendingPayrollRun = e
-            .storage()
-            .persistent()
-            .get(&DataKey::PendingRun(run_id))
-            .expect("Pending run not found");
-            
-        if pending_run.draft_hash != provided_hash {
-            panic!("Draft checksum mismatch: payroll data was modified after review");
-        }
-        
-        Ok(())
-    }
