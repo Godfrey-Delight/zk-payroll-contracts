@@ -153,7 +153,11 @@ fn employer_onboarding_event_order_is_stable() {
     });
 
     let events = env.events().all();
-    assert_eq!(events.len(), 3, "onboarding flow must emit exactly three events");
+    assert_eq!(
+        events.len(),
+        3,
+        "onboarding flow must emit exactly three events"
+    );
 
     let expected = [
         Symbol::new(&env, "CompanyRegistered"),

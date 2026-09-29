@@ -1015,6 +1015,31 @@ pub fn emit_reviewer_removed(e: &Env, reviewer: Address) {
     );
 }
 
+/// Emitted when the maximum concurrently authorized reviewer count is set
+/// or replaced by admin (issue #539).
+pub fn emit_max_reviewers_set(e: &Env, max_reviewers: u32) {
+    e.events().publish(
+        (payroll_topic(), Symbol::new(e, "max_reviewers_set")),
+        max_reviewers,
+    );
+}
+
+/// Emitted when the operator key for signed off-chain authorizations is
+/// registered or replaced by admin (issue #519). Never carries the key
+/// itself in the event; `get_operator_key` is the read path for that.
+pub fn emit_operator_key_registered(e: &Env) {
+    e.events()
+        .publish((payroll_topic(), Symbol::new(e, "operator_key_set")), ());
+}
+
+/// Emitted when the operator key is revoked by admin (issue #519).
+pub fn emit_operator_key_revoked(e: &Env) {
+    e.events().publish(
+        (payroll_topic(), Symbol::new(e, "operator_key_revoked")),
+        (),
+    );
+}
+
 /// Emitted when an authorized reviewer approves a payroll run.
 pub fn emit_run_approved(e: &Env, run_id: u64, reviewer: Address) {
     e.events().publish(
@@ -1228,5 +1253,87 @@ pub fn emit_registry_admin_config_version_updated(
     e.events().publish(
         (Symbol::new(e, "AdminConfigVersionUpdated"), company_id),
         (new_version, updated_by),
+    );
+}
+
+// ── Issue #479: Employee Status Change Events ────────────────────────────────
+
+/// Emitted when an employee is activated or reactivated in the registry.
+pub fn emit_employee_activated(
+    e: &Env,
+    company_id: u64,
+    employee: Address,
+    previous_status: u32,
+    new_status: u32,
+) {
+    e.events().publish(
+        (Symbol::new(e, "EmployeeActivated"), company_id, employee),
+        (
+            previous_status,
+            new_status,
+            e.ledger().sequence(),
+            e.ledger().timestamp(),
+        ),
+    );
+}
+
+/// Emitted when an employee is suspended in the registry.
+pub fn emit_employee_suspended(
+    e: &Env,
+    company_id: u64,
+    employee: Address,
+    previous_status: u32,
+    new_status: u32,
+) {
+    e.events().publish(
+        (Symbol::new(e, "EmployeeSuspended"), company_id, employee),
+        (
+            previous_status,
+            new_status,
+            e.ledger().sequence(),
+            e.ledger().timestamp(),
+        ),
+    );
+}
+
+/// Emitted when an employee is offboarded in the registry.
+pub fn emit_employee_offboarded(
+    e: &Env,
+    company_id: u64,
+    employee: Address,
+    previous_status: u32,
+    new_status: u32,
+) {
+    e.events().publish(
+        (Symbol::new(e, "EmployeeOffboarded"), company_id, employee),
+        (
+            previous_status,
+            new_status,
+            e.ledger().sequence(),
+            e.ledger().timestamp(),
+        ),
+    );
+}
+
+// ── Issue #481: Interrupted Payroll Run Recovery Events ───────────────────────
+
+/// Emitted when an interrupted payroll run is safely recovered for resumption.
+pub fn emit_interrupted_run_recovered(
+    e: &Env,
+    employer: Address,
+    batch_root: BytesN<32>,
+    asset: Address,
+    execution_nonce: BytesN<32>,
+    resumed_checkpoint_index: u32,
+    total_checkpoints: u32,
+) {
+    e.events().publish(
+        (Symbol::new(e, "InterruptedRunRecovered"), employer, asset),
+        (
+            batch_root,
+            execution_nonce,
+            resumed_checkpoint_index,
+            total_checkpoints,
+        ),
     );
 }

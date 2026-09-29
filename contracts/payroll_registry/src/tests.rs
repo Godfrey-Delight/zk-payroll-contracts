@@ -879,11 +879,17 @@ fn test_successful_payout_destination_update_by_employee() {
     client.add_employee(&company_id, &employee, &commitment);
 
     // Initial payout destination defaults to employee address
-    assert_eq!(client.get_payout_destination(&company_id, &employee), employee);
+    assert_eq!(
+        client.get_payout_destination(&company_id, &employee),
+        employee
+    );
 
     // Employee updates their payout destination
     client.update_payout_destination(&company_id, &employee, &new_destination);
-    assert_eq!(client.get_payout_destination(&company_id, &employee), new_destination);
+    assert_eq!(
+        client.get_payout_destination(&company_id, &employee),
+        new_destination
+    );
 }
 
 #[test]
@@ -996,12 +1002,12 @@ fn test_offboarded_employee_cannot_be_changed() {
     let employee = Address::generate(&env);
     let commitment = BytesN::from_array(&env, &[0; 32]);
     let client = PayrollRegistryClient::new(&env, &env.register_contract(None, PayrollRegistry {}));
-    
+
     let company_id = client.register_company(&admin, &treasury);
     client.add_employee(&company_id, &employee, &commitment);
-    
+
     client.set_employee_status(&company_id, &employee, &EmployeeStatus::Offboarded);
-    
+
     // Attempting to change status should panic
     client.set_employee_status(&company_id, &employee, &EmployeeStatus::Active);
 }

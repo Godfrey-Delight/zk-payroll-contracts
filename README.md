@@ -160,6 +160,28 @@ let revision = payroll.get_config_revision(); // 1, 2, 3, ... with no gaps
 See [docs/config-audit-events.md](docs/config-audit-events.md) for the schema,
 key table, and how to verify a reference.
 
+### Payroll Period Health Summary
+
+The `payroll` contract exposes `get_period_health_summary` to provide operators and monitoring dashboards with actionable operational readiness diagnostics without leaking private employee identities or individual salary information (#552).
+
+```rust
+let summary = payroll.get_period_health_summary(&period);
+// summary.status: PeriodHealthStatus (Healthy, Warning, Blocked)
+// summary.reason: PeriodHealthReason (Normal, PreOpen, GracePeriod, WindowClosed, ContractPaused, PeriodFrozen, ...)
+// summary.can_execute: bool
+// summary.is_frozen: bool
+// summary.is_paused: bool
+// summary.window_status: Option<SettlementWindowStatus>
+// summary.capacity_configured: bool
+// summary.batch_count: u32
+// summary.employee_count: u32
+// summary.capacity_exceeded: bool
+```
+
+- **Operational Health**: Classifies periods into `Healthy` (ready for execution), `Warning` (grace period, frozen configuration), or `Blocked` (paused, closed window, capacity exhausted).
+- **Actionable Diagnostics**: Clear, typed reason codes indicate exact blockers or operational alerts (e.g., `PreOpen`, `ContractPaused`, `BatchCapacityExceeded`).
+- **Privacy Guarantees**: Plaintext salaries, employee commitments, and individual recipient rows are never exposed.
+
 ### Register Employee with Private Salary
 
 ```rust
@@ -342,6 +364,48 @@ execution, and audit access — with sample payloads and input/output tables.
 
 See [docs/events.md](docs/events.md) for the full event schema reference and
 consumption expectations.
+
+## Clock Boundary Testing
+
+The contracts include comprehensive clock boundary tests to ensure timestamp-based cutoff mechanisms work correctly at exact boundaries and adjacent edge cases. These tests improve reliability of time-sensitive payroll operations:
+
+### Boundary Test Coverage
+
+- **Settlement Window Enforcement** (`contracts/payroll/tests/settlement_window_enforcement.rs`)
+  - Exact boundary tests for `open_at`, `execution_start`, `execution_end`, and `close_at` timestamps
+  - Adjacent boundary cases (one tick before/after each cutoff)
+  - Mid-period and mid-grace period validations
+  - Grace period cancellation and expiration at boundaries
+
+- **Approval Expiry** (`contracts/payroll/tests/approval_expiry.rs`)
+  - Exact expiry boundary validation
+  - One tick before/after expiry cases
+  - Custom expiry period boundaries
+  - Multiple approvals with different timestamps
+
+- **Threshold Rotation Grace Periods** (`contracts/payroll_registry/tests/threshold_rotation_boundary_tests.rs`)
+  - Exact grace period boundary activation
+  - Adjacent timestamp validation for rotation proposals
+  - Zero grace period edge cases
+  - Cancellation before/after grace period boundaries
+
+- **Reservation Expiry** (`contracts/payroll/tests/reservation_expiry_boundary_tests.rs`)
+  - Exact expiry boundary release operations
+  - One tick before/after expiry validation
+  - Zero and large expiry offset edge cases
+  - Multiple reservations with different expiry times
+
+### Running Boundary Tests
+
+```bash
+# Run all boundary tests
+cargo test --test settlement_window_enforcement
+cargo test --test approval_expiry
+cargo test --test threshold_rotation_boundary_tests
+cargo test --test reservation_expiry_boundary_tests
+```
+
+These boundary tests ensure that payroll cutoffs work reliably at exact timestamps and prevent edge case failures in production.
 
 ## Local Setup & Test Troubleshooting
 
