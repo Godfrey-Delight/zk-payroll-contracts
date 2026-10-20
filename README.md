@@ -132,6 +132,13 @@ payment_executor.process_payment(
 );
 ```
 
+The `payroll` contract can use an admin-configured fallback treasury when the
+primary treasury cannot cover an individual payment. Configure it with
+`configure_fallback_treasury(fallback_address)`; the fallback must be a
+different address and already hold the required payment tokens. Payments use
+the primary treasury whenever it can cover them, and otherwise use the fallback.
+If neither source can cover a payment, the batch fails atomically.
+
 ### Compliance Audit
 
 ```rust

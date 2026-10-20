@@ -25,6 +25,7 @@ pub struct ContractAddresses {
 #[contracttype]
 pub enum DataKey {
     Addresses,
+    FallbackTreasury,
 }
 
 #[contractimpl]
@@ -50,6 +51,25 @@ impl Payroll {
             treasury,
         };
         e.storage().persistent().set(&key, &addrs);
+    }
+
+    /// Configure the treasury used when the primary treasury cannot fund a payment.
+    /// Only the registered admin may update this setting.
+    pub fn configure_fallback_treasury(e: Env, fallback_treasury: Address) {
+        let addrs: ContractAddresses = e
+            .storage()
+            .persistent()
+            .get(&DataKey::Addresses)
+            .expect("Not initialized");
+
+        addrs.admin.require_auth();
+        if fallback_treasury == addrs.treasury {
+            panic!("Fallback treasury must differ from primary treasury");
+        }
+
+        e.storage()
+            .persistent()
+            .set(&DataKey::FallbackTreasury, &fallback_treasury);
     }
 
     pub fn deposit(_e: Env, _from: Address, _amount: i128) {
@@ -156,7 +176,22 @@ impl Payroll {
             // ── FLOW STEP 4: Token transfer ───────────────────────────────────
             // A panic here (e.g. insufficient treasury balance) causes Soroban to
             // roll back the entire transaction, including the nullifier recorded above.
-            token_client.transfer(&addrs.treasury, &employee, &amount);
+            let treasury = if token_client.balance(&addrs.treasury) >= amount {
+                addrs.treasury.clone()
+            } else {
+                let fallback_treasury: Address = e
+                    .storage()
+                    .persistent()
+                    .get(&DataKey::FallbackTreasury)
+                    .expect(
+                        "Primary treasury is underfunded and no fallback treasury is configured",
+                    );
+                if token_client.balance(&fallback_treasury) < amount {
+                    panic!("Insufficient funds in primary and fallback treasuries");
+                }
+                fallback_treasury
+            };
+            token_client.transfer(&treasury, &employee, &amount);
 
             // ── FLOW STEP 5: Emit event for off-chain indexers ────────────────
             e.events().publish(
