@@ -1,0 +1,12 @@
+use payroll::Payroll;
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn normalization() {
+        let mut p = Payroll::new();
+        p.add_asset_to_allowlist("BTC".to_string()).unwrap();
+        assert!(p.is_allowed("btc".to_string()));
+        assert!(p.reserve_asset(" BTC ".to_string()).is_err());
+    }
+}

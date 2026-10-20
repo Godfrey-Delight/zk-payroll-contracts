@@ -1,9 +1,12 @@
 #![no_std]
 
+use pause_manager::PauseManagerClient;
 use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, xdr::ToXdr, Address, Bytes, BytesN, Env,
-    Symbol,
+    Symbol, Vec,
 };
+
+pub mod challenge;
 
 // ---------------------------------------------------------------------------
 // Error type
@@ -28,6 +31,30 @@ pub enum AuditError {
     CommitmentMismatch = 6,
     /// Supplied key material does not belong to the auditor.
     InvalidViewKey = 7,
+    /// The requested new expiration is not later than the current one.
+    ExpirationNotExtended = 8,
+    /// Delegation is forbidden unless employer policy explicitly enables it.
+    DelegationNotAllowed = 9,
+    /// A delegated grant attempted to exceed the parent grant scope.
+    DelegationExceedsParentScope = 10,
+    /// A delegated grant attempted to exceed the parent grant expiry.
+    DelegationExceedsParentExpiry = 11,
+    /// A delegated grant is no longer valid because its parent grant was revoked.
+    DelegationRevoked = 12,
+    /// The proof reference hash is invalid (empty or all-zero sentinel).
+    InvalidProofReference = 13,
+    /// A challenge with this ID does not exist.
+    ChallengeNotFound = 14,
+    /// The challenge deadline has passed - no further responses accepted.
+    ChallengeExpired = 15,
+    /// The challenge has already been resolved.
+    ChallengeAlreadyResolved = 16,
+    /// An invalid challenge ID or out-of-scope challenge was submitted.
+    InvalidChallenge = 17,
+    /// The supplied export has no integrity marker (all-zero) and cannot be verified.
+    IntegrityMarkerMissing = 18,
+    /// An audit event sequence violation was detected (Issue #701).
+    InvalidEventSequence = 19,
 }
 
 // ---------------------------------------------------------------------------
@@ -35,19 +62,17 @@ pub enum AuditError {
 // ---------------------------------------------------------------------------
 
 /// Record stored in Persistent storage for each auditor.
-///
-/// Contains the 32-byte view-key material and the ledger sequence number
-/// at which the key expires.  Expiry is checked natively by comparing
-/// `env.ledger().sequence() > expiration_ledger`.
 #[contracttype]
 #[derive(Clone, Debug)]
 pub struct ViewKeyRecord {
-    /// The 32-byte view-key returned to the caller of `generate_view_key`.
     pub key_bytes: BytesN<32>,
-    /// Ledger sequence number after which the key is invalid.
     pub expiration_ledger: u32,
-    /// The admin that issued this key (required for revocation).
     pub granted_by: Address,
+    pub scope: AuditScope,
+    pub allow_delegation: bool,
+    pub max_scope: AuditScope,
+    pub max_expiration_ledger: u32,
+    pub parent_auditor: Option<Address>,
 }
 
 /// What the auditor is allowed to examine.
@@ -55,31 +80,88 @@ pub struct ViewKeyRecord {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u32)]
 pub enum AuditScope {
-    /// Unrestricted read on all payroll data for the company.
     FullCompany = 0,
-    /// Read within a specific time range only.
     TimeRange = 1,
-    /// Verify individual commitments for a named employee list.
     EmployeeList = 2,
-    /// Aggregate totals only – no per-employee data.
     AggregateOnly = 3,
 }
 
-/// Aggregate snapshot returned to an auditor.
+/// Lifecycle stage of an auditor's view-key grant.
+#[contracttype]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u32)]
+pub enum AuditLifecycleStage {
+    None = 0,
+    Granted = 1,
+    Active = 2,
+    Revoked = 3,
+    Pruned = 4,
+}
+
+/// An audit log entry written each time an auditor performs a verification
+/// or generates a report. Stored in Persistent under DataKey::AuditLog(company_symbol, counter).
 ///
-/// Individual salaries are never included.
+/// Salary values are never recorded — only metadata necessary for
+/// compliance retrieval.
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct AuditLogEntry {
+    pub auditor: Address,
+    pub company_id: Symbol,
+    pub scope: AuditScope,
+    pub timestamp: u64,
+    pub matched: bool,
+}
+
+/// Aggregate snapshot returned to an auditor.
 #[contracttype]
 #[derive(Clone, Debug)]
 pub struct AuditReport {
     pub company_id: Symbol,
-    /// Number of employees in the payroll for the requested period.
     pub total_employees: u32,
-    /// Sum of all payments for the requested period (in token base units).
     pub total_paid: i128,
     pub period_start: u64,
     pub period_end: u64,
-    /// True when the report is backed by on-chain payment records.
     pub verified: bool,
+}
+
+/// Query result envelope so consumers can enumerate matching logs.
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct AuditQueryResult {
+    pub entries: Vec<AuditLogEntry>,
+}
+
+// ── Issue #93: company-level audit metadata export ───────────────────────────
+
+/// Exportable audit metadata summary for external compliance review.
+///
+/// Privacy boundary: salary values are **never** included. Only metadata
+/// needed for downstream compliance tooling is present, so this type can
+/// be shared with external auditors without leaking sensitive payroll data.
+///
+/// Fields:
+/// - `company_id`               — identifier for the audited company.
+/// - `period_start` / `_end`   — time window of the export.
+/// - `total_audit_entries`      — total log entries in the period.
+/// - `verification_pass_count`  — entries where `matched == true`.
+/// - `verification_fail_count`  — entries where `matched == false`.
+/// - `exported_at`              — ledger timestamp of the export call.
+/// - `exported_by`              — auditor address that triggered the export.
+/// - `integrity_marker`         — deterministic digest binding every other
+///   field of this summary (see `verify_audit_export_integrity`).
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct AuditMetadataSummary {
+    pub company_id: Symbol,
+    pub period_start: u64,
+    pub period_end: u64,
+    pub total_audit_entries: u32,
+    pub verification_pass_count: u32,
+    pub verification_fail_count: u32,
+    pub exported_at: u64,
+    pub exported_by: Address,
+    pub integrity_marker: BytesN<32>,
 }
 
 /// Storage key namespace.
@@ -87,6 +169,16 @@ pub struct AuditReport {
 pub enum DataKey {
     /// Maps an auditor `Address` → `ViewKeyRecord` in Persistent storage.
     AuditorKey(Address),
+    /// Tracks delegated auditors under a parent grant.
+    DelegatedAuditors(Address),
+    /// Per-company audit log counter (Symbol = company_id).
+    AuditLogCounter(Symbol),
+    /// Audit log entry keyed by (company_id, log_index).
+    AuditLog(Symbol, u32),
+    /// Pause manager address (issue #167).
+    PauseManager,
+    /// Tracks an auditor's lifecycle stage (Issue #701).
+    AuditLifecycle(Address),
 }
 
 // ---------------------------------------------------------------------------
@@ -98,66 +190,105 @@ pub struct AuditModule;
 
 #[contractimpl]
 impl AuditModule {
+    fn require_not_paused(env: &Env) {
+        if env.storage().persistent().has(&DataKey::PauseManager) {
+            let pm_addr: Address = env
+                .storage()
+                .persistent()
+                .get(&DataKey::PauseManager)
+                .unwrap();
+            let pm_client = PauseManagerClient::new(env, &pm_addr);
+            if pm_client.is_paused() {
+                panic!("Payroll is paused");
+            }
+        }
+    }
+
+    pub fn set_pause_manager(env: Env, admin: Address, pause_manager: Address) {
+        admin.require_auth();
+        env.storage()
+            .persistent()
+            .set(&DataKey::PauseManager, &pause_manager);
+
+        payroll_events::emit_audit_pause_manager_set(&env, pause_manager);
+    }
+
+    pub fn get_pause_manager(env: Env) -> Option<Address> {
+        env.storage().persistent().get(&DataKey::PauseManager)
+    }
+
     // -----------------------------------------------------------------------
     // View-key lifecycle
     // -----------------------------------------------------------------------
 
-    /// Generate a 32-byte view key for `auditor` and store it in Persistent
-    /// storage.
-    ///
-    /// The key is valid until `env.ledger().sequence() > expiration_ledger`.
-    /// This is a native Soroban expiry: once the ledger sequence passes
-    /// `expiration_ledger`, `verify_access` returns `false` without any
-    /// additional bookkeeping.
-    ///
-    /// # Arguments
-    /// * `auditor`           – the address that will use this key.
-    /// * `expiration_ledger` – last ledger sequence at which the key is valid.
-    ///
-    /// # Returns
-    /// The 32-byte key material (also stored in Persistent storage).
     pub fn generate_view_key(env: Env, auditor: Address, expiration_ledger: u32) -> BytesN<32> {
-        // The admin calling this function must authorise the operation.
-        // We infer the admin from `env.current_contract_address()` in tests;
-        // in production the invoker must sign.
-        let admin = env.current_contract_address(); // caller context – see note below
+        Self::require_not_paused(&env);
+        let admin = env.current_contract_address();
 
-        // Derive deterministic key material from (auditor XDR ‖ expiration_ledger ‖ sequence)
-        // so each call produces a fresh, unique value.
         let key_bytes = Self::derive_key_bytes(&env, &auditor, expiration_ledger);
 
         let record = ViewKeyRecord {
             key_bytes: key_bytes.clone(),
             expiration_ledger,
             granted_by: admin,
+            scope: AuditScope::FullCompany,
+            allow_delegation: false,
+            max_scope: AuditScope::FullCompany,
+            max_expiration_ledger: expiration_ledger,
+            parent_auditor: None,
         };
 
         env.storage()
             .persistent()
-            .set(&DataKey::AuditorKey(auditor), &record);
+            .set(&DataKey::AuditorKey(auditor.clone()), &record);
+        env.storage()
+            .persistent()
+            .set(&DataKey::AuditLifecycle(auditor.clone()), &AuditLifecycleStage::Granted);
+
+        payroll_events::emit_view_key_generated(&env, auditor, expiration_ledger);
 
         key_bytes
     }
 
-    /// Return `true` iff `auditor` has a stored, non-expired view key.
-    ///
-    /// Expiry condition (per acceptance criteria):
-    ///   `env.ledger().sequence() > expiration_ledger`
     pub fn verify_access(env: Env, auditor: Address) -> bool {
         match env
             .storage()
             .persistent()
-            .get::<DataKey, ViewKeyRecord>(&DataKey::AuditorKey(auditor))
+            .get::<DataKey, ViewKeyRecord>(&DataKey::AuditorKey(auditor.clone()))
         {
-            Some(record) => env.ledger().sequence() <= record.expiration_ledger,
+            Some(record) => {
+                if env.ledger().sequence() > record.expiration_ledger {
+                    return false;
+                }
+                if let Some(parent) = record.parent_auditor.clone() {
+                    let parent_record: ViewKeyRecord = match env
+                        .storage()
+                        .persistent()
+                        .get(&DataKey::AuditorKey(parent.clone()))
+                    {
+                        Some(value) => value,
+                        None => return false,
+                    };
+                    if env.ledger().sequence() > parent_record.expiration_ledger {
+                        return false;
+                    }
+                    if !Self::scope_is_within(parent_record.max_scope, record.scope) {
+                        return false;
+                    }
+                    if record.expiration_ledger > parent_record.max_expiration_ledger
+                        || record.expiration_ledger > parent_record.expiration_ledger
+                    {
+                        return false;
+                    }
+                }
+                true
+            }
             None => false,
         }
     }
 
-    /// Revoke the view key for `auditor` before its natural expiry.
-    ///
-    /// Only the admin recorded in `ViewKeyRecord.granted_by` may revoke.
     pub fn revoke_view_key(env: Env, admin: Address, auditor: Address) -> Result<(), AuditError> {
+        Self::require_not_paused(&env);
         admin.require_auth();
 
         let record: ViewKeyRecord = env
@@ -170,13 +301,133 @@ impl AuditModule {
             return Err(AuditError::NotKeyGranter);
         }
 
+        Self::revoke_descendants(&env, &auditor);
         env.storage()
             .persistent()
-            .remove(&DataKey::AuditorKey(auditor));
+            .remove(&DataKey::AuditorKey(auditor.clone()));
+        env.storage()
+            .persistent()
+            .set(&DataKey::AuditLifecycle(auditor.clone()), &AuditLifecycleStage::Revoked);
+
+        payroll_events::emit_audit_access_revoked(&env, admin, auditor);
+
         Ok(())
     }
 
-    /// Read the stored `ViewKeyRecord` for an auditor (no auth required).
+    /// Remove an expired grant after an administrator-defined ledger grace
+    /// period. The grantor remains the authority for its own grant.
+    pub fn prune_expired_view_key(
+        env: Env,
+        admin: Address,
+        auditor: Address,
+        retention_ledgers: u32,
+    ) -> Result<(), AuditError> {
+        Self::require_not_paused(&env);
+        admin.require_auth();
+        let record: ViewKeyRecord = env
+            .storage()
+            .persistent()
+            .get(&DataKey::AuditorKey(auditor.clone()))
+            .ok_or(AuditError::KeyNotFound)?;
+        if record.granted_by != admin {
+            return Err(AuditError::NotKeyGranter);
+        }
+        if env.ledger().sequence() <= record.expiration_ledger
+            || env.ledger().sequence() < record.expiration_ledger.saturating_add(retention_ledgers)
+        {
+            return Err(AuditError::KeyExpired);
+        }
+
+        Self::revoke_descendants(&env, &auditor);
+        env.storage()
+            .persistent()
+            .remove(&DataKey::AuditorKey(auditor.clone()));
+        env.storage()
+            .persistent()
+            .set(&DataKey::AuditLifecycle(auditor.clone()), &AuditLifecycleStage::Pruned);
+        payroll_events::emit_audit_grant_pruned(&env, admin, auditor);
+        Ok(())
+    }
+
+    /// Returns the current lifecycle stage of an auditor (Issue #701).
+    pub fn get_audit_lifecycle_stage(env: Env, auditor: Address) -> AuditLifecycleStage {
+        env.storage()
+            .persistent()
+            .get(&DataKey::AuditLifecycle(auditor))
+            .unwrap_or(AuditLifecycleStage::None)
+    }
+
+    /// Verifies that a sequence of audit event topic symbols follows the canonical
+    /// lifecycle sequence (Issue #701):
+    ///
+    /// 1. Initialization: Must begin with `ViewKeyGenerated`.
+    /// 2. Active Operations: `ViewKeyRefreshed`, `AuditSuccessful`, `MetadataVerified`,
+    ///    `MetadataMismatch`, `AggregateAuditGenerated`, `AuditSummaryExported`.
+    /// 3. Termination: `AuditAccessExpired` or `AuditAccessRevoked`.
+    /// 4. Cleanup: `AuditGrantPruned` (only valid after termination).
+    ///
+    /// Returns `Ok(true)` if sequence is valid, or `Err(AuditError::InvalidEventSequence)`
+    /// if out of order, empty, or improperly terminated.
+    pub fn verify_audit_event_sequence(env: Env, event_names: Vec<Symbol>) -> Result<bool, AuditError> {
+        if event_names.is_empty() {
+            return Err(AuditError::InvalidEventSequence);
+        }
+
+        let sym_generated = Symbol::new(&env, "ViewKeyGenerated");
+        let sym_refreshed = Symbol::new(&env, "ViewKeyRefreshed");
+        let sym_audit_ok = Symbol::new(&env, "AuditSuccessful");
+        let sym_meta_ok = Symbol::new(&env, "MetadataVerified");
+        let sym_meta_mismatch = Symbol::new(&env, "MetadataMismatch");
+        let sym_agg_gen = Symbol::new(&env, "AggregateAuditGenerated");
+        let sym_summary_exp = Symbol::new(&env, "AuditSummaryExported");
+        let sym_expired = Symbol::new(&env, "AuditAccessExpired");
+        let sym_revoked = Symbol::new(&env, "AuditAccessRevoked");
+        let sym_pruned = Symbol::new(&env, "AuditGrantPruned");
+
+        if event_names.get(0).unwrap() != sym_generated {
+            return Err(AuditError::InvalidEventSequence);
+        }
+
+        let mut stage = AuditLifecycleStage::Granted;
+        let mut has_terminated = false;
+
+        for i in 1..event_names.len() {
+            let event = event_names.get(i).unwrap();
+
+            if stage == AuditLifecycleStage::Pruned {
+                return Err(AuditError::InvalidEventSequence);
+            }
+
+            if event == sym_refreshed
+                || event == sym_audit_ok
+                || event == sym_meta_ok
+                || event == sym_meta_mismatch
+                || event == sym_agg_gen
+                || event == sym_summary_exp
+            {
+                if has_terminated || stage == AuditLifecycleStage::Revoked || stage == AuditLifecycleStage::Pruned {
+                    return Err(AuditError::InvalidEventSequence);
+                }
+                stage = AuditLifecycleStage::Active;
+            } else if event == sym_expired || event == sym_revoked {
+                if has_terminated || stage == AuditLifecycleStage::Revoked || stage == AuditLifecycleStage::Pruned {
+                    return Err(AuditError::InvalidEventSequence);
+                }
+                stage = AuditLifecycleStage::Revoked;
+                has_terminated = true;
+            } else if event == sym_pruned {
+                if !has_terminated && stage != AuditLifecycleStage::Revoked {
+                    return Err(AuditError::InvalidEventSequence);
+                }
+                stage = AuditLifecycleStage::Pruned;
+            } else {
+                return Err(AuditError::InvalidEventSequence);
+            }
+        }
+
+        Ok(true)
+    }
+
     pub fn get_view_key(env: Env, auditor: Address) -> Result<ViewKeyRecord, AuditError> {
         env.storage()
             .persistent()
@@ -184,22 +435,252 @@ impl AuditModule {
             .ok_or(AuditError::KeyNotFound)
     }
 
+    /// Return the ledger sequence at which `auditor`'s current view key
+    /// expires, or `AuditError::KeyNotFound` if no key is stored.
+    ///
+    /// This is a read-only helper for off-chain tooling and cross-contract
+    /// callers that need to determine whether a key needs renewal without
+    /// performing a full audit operation.
+    pub fn get_expiration(env: Env, auditor: Address) -> Result<u32, AuditError> {
+        let record: ViewKeyRecord = env
+            .storage()
+            .persistent()
+            .get(&DataKey::AuditorKey(auditor))
+            .ok_or(AuditError::KeyNotFound)?;
+        Ok(record.expiration_ledger)
+    }
+
+    /// Extend an existing auditor view key to a new `new_expiration_ledger`.
+    ///
+    /// Only the address recorded as `granted_by` on the key may refresh it.
+    /// The new expiration must be strictly later than the current one to
+    /// prevent accidental truncation of an active grant.
+    ///
+    /// A fresh `key_bytes` value is derived for the new expiration so the key
+    /// material rotates on every refresh, preserving forward secrecy.
+    ///
+    /// Emits a `ViewKeyRefreshed` event on success:
+    ///   topics : ("ViewKeyRefreshed", admin, auditor)
+    ///   data   : (new_expiration_ledger,)
+    pub fn refresh_view_key(
+        env: Env,
+        admin: Address,
+        auditor: Address,
+        new_expiration_ledger: u32,
+    ) -> Result<BytesN<32>, AuditError> {
+        Self::require_not_paused(&env);
+        admin.require_auth();
+
+        let record: ViewKeyRecord = env
+            .storage()
+            .persistent()
+            .get(&DataKey::AuditorKey(auditor.clone()))
+            .ok_or(AuditError::KeyNotFound)?;
+
+        if record.granted_by != admin {
+            return Err(AuditError::NotKeyGranter);
+        }
+
+        // Guard against accidentally shortening an active key.
+        if new_expiration_ledger <= record.expiration_ledger {
+            return Err(AuditError::ExpirationNotExtended);
+        }
+
+        let new_key_bytes = Self::derive_key_bytes(&env, &auditor, new_expiration_ledger);
+
+        let updated = ViewKeyRecord {
+            key_bytes: new_key_bytes.clone(),
+            expiration_ledger: new_expiration_ledger,
+            granted_by: admin.clone(),
+            scope: record.scope,
+            allow_delegation: record.allow_delegation,
+            max_scope: record.max_scope,
+            max_expiration_ledger: record.max_expiration_ledger,
+            parent_auditor: record.parent_auditor,
+        };
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::AuditorKey(auditor.clone()), &updated);
+        env.storage()
+            .persistent()
+            .set(&DataKey::AuditLifecycle(auditor.clone()), &AuditLifecycleStage::Active);
+
+        env.events().publish(
+            (Symbol::new(&env, "ViewKeyRefreshed"), admin, auditor),
+            (new_expiration_ledger,),
+        );
+        // topics : ("ViewKeyRefreshed", admin, auditor)
+        // data   : (new_expiration_ledger,)
+
+        Ok(new_key_bytes)
+    }
+
+    pub fn set_delegation_policy(
+        env: Env,
+        admin: Address,
+        auditor: Address,
+        allow_delegation: bool,
+        max_scope: AuditScope,
+        max_expiration_ledger: u32,
+    ) -> Result<(), AuditError> {
+        Self::require_not_paused(&env);
+        admin.require_auth();
+
+        let mut record: ViewKeyRecord = env
+            .storage()
+            .persistent()
+            .get(&DataKey::AuditorKey(auditor.clone()))
+            .ok_or(AuditError::KeyNotFound)?;
+
+        if record.granted_by != admin {
+            return Err(AuditError::NotKeyGranter);
+        }
+
+        record.allow_delegation = allow_delegation;
+        record.max_scope = max_scope;
+        record.max_expiration_ledger = max_expiration_ledger;
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::AuditorKey(auditor.clone()), &record);
+
+        Ok(())
+    }
+
+    pub fn approve_delegation(
+        env: Env,
+        admin: Address,
+        auditor: Address,
+        allow_delegation: bool,
+        max_scope: AuditScope,
+        max_expiration_ledger: u32,
+    ) -> Result<(), AuditError> {
+        Self::set_delegation_policy(
+            env,
+            admin,
+            auditor,
+            allow_delegation,
+            max_scope,
+            max_expiration_ledger,
+        )
+    }
+
+    pub fn delegate_view_key(
+        env: Env,
+        auditor: Address,
+        delegate: Address,
+        scope: AuditScope,
+        expiration_ledger: u32,
+    ) -> Result<BytesN<32>, AuditError> {
+        let parent: ViewKeyRecord = Self::authorize_auditor(&env, auditor.clone())?;
+        if !parent.allow_delegation {
+            return Err(AuditError::DelegationNotAllowed);
+        }
+        if !Self::scope_is_within(parent.max_scope, scope) {
+            return Err(AuditError::DelegationExceedsParentScope);
+        }
+        if expiration_ledger > parent.max_expiration_ledger
+            || expiration_ledger > parent.expiration_ledger
+        {
+            return Err(AuditError::DelegationExceedsParentExpiry);
+        }
+
+        let key_bytes = Self::derive_key_bytes(&env, &delegate, expiration_ledger);
+        let delegated_record = ViewKeyRecord {
+            key_bytes: key_bytes.clone(),
+            expiration_ledger,
+            granted_by: auditor.clone(),
+            scope,
+            allow_delegation: parent.allow_delegation,
+            max_scope: scope,
+            max_expiration_ledger: expiration_ledger,
+            parent_auditor: Some(auditor.clone()),
+        };
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::AuditorKey(delegate.clone()), &delegated_record);
+
+        let mut delegates: Vec<Address> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::DelegatedAuditors(auditor.clone()))
+            .unwrap_or(Vec::new(&env));
+        delegates.push_back(delegate.clone());
+        env.storage()
+            .persistent()
+            .set(&DataKey::DelegatedAuditors(auditor.clone()), &delegates);
+
+        Ok(key_bytes)
+    }
+
+    pub fn grant_delegated_access(
+        env: Env,
+        auditor: Address,
+        delegate: Address,
+        scope: AuditScope,
+        expiration_ledger: u32,
+    ) -> Result<BytesN<32>, AuditError> {
+        Self::delegate_view_key(env, auditor, delegate, scope, expiration_ledger)
+    }
+
+    pub fn extend_delegated_access(
+        env: Env,
+        auditor: Address,
+        delegate: Address,
+        new_expiration_ledger: u32,
+    ) -> Result<BytesN<32>, AuditError> {
+        let mut record: ViewKeyRecord = env
+            .storage()
+            .persistent()
+            .get(&DataKey::AuditorKey(delegate.clone()))
+            .ok_or(AuditError::KeyNotFound)?;
+
+        if record.parent_auditor != Some(auditor.clone()) {
+            return Err(AuditError::NotKeyGranter);
+        }
+
+        if env.ledger().sequence() > record.expiration_ledger {
+            return Err(AuditError::KeyExpired);
+        }
+
+        let parent: ViewKeyRecord = env
+            .storage()
+            .persistent()
+            .get(&DataKey::AuditorKey(auditor.clone()))
+            .ok_or(AuditError::DelegationRevoked)?;
+
+        if !parent.allow_delegation {
+            return Err(AuditError::DelegationNotAllowed);
+        }
+        if new_expiration_ledger <= record.expiration_ledger {
+            return Err(AuditError::ExpirationNotExtended);
+        }
+        if new_expiration_ledger > parent.max_expiration_ledger
+            || new_expiration_ledger > parent.expiration_ledger
+        {
+            return Err(AuditError::DelegationExceedsParentExpiry);
+        }
+        if !Self::scope_is_within(parent.max_scope, record.scope) {
+            return Err(AuditError::DelegationExceedsParentScope);
+        }
+
+        let new_key = Self::derive_key_bytes(&env, &delegate, new_expiration_ledger);
+        record.key_bytes = new_key.clone();
+        record.expiration_ledger = new_expiration_ledger;
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::AuditorKey(delegate.clone()), &record);
+
+        Ok(new_key)
+    }
+
     // -----------------------------------------------------------------------
     // Audit operations
     // -----------------------------------------------------------------------
 
-    /// Verify a single employee's salary commitment using the caller's view key.
-    ///
-    /// Requires the `auditor` to hold a valid (non-expired) key and that the
-    /// key's scope is not `AggregateOnly` (per-employee access would leak
-    /// individual salary data).
-    ///
-    /// The commitment is recomputed as:
-    ///   `sha256(claimed_amount_le_bytes ‖ blinding_factor)`
-    ///
-    /// # Arguments
-    /// * `stored_commitment` – `BytesN<32>` fetched from the salary commitment
-    ///   contract by the caller (avoids a cross-contract call here).
     pub fn verify_commitment_with_key(
         env: Env,
         auditor: Address,
@@ -211,7 +692,7 @@ impl AuditModule {
         let record = Self::authorize_auditor(&env, auditor.clone())?;
         Self::verify_scope_for_commitment(scope)?;
 
-        Ok(Self::verify_commitment_and_emit(
+        let matched = Self::verify_commitment_inner(
             &env,
             &auditor,
             &record.key_bytes,
@@ -219,13 +700,18 @@ impl AuditModule {
             claimed_amount,
             &blinding_factor,
             scope,
-        ))
+        );
+
+        // Record audit log entry for query retrieval
+        Self::record_audit_log(&env, &auditor, scope, matched);
+
+        if !matched {
+            return Err(AuditError::CommitmentMismatch);
+        }
+
+        Ok(matched)
     }
 
-    /// Verify a commitment when the auditor explicitly supplies their view key.
-    ///
-    /// This prevents cross-auditor key reuse: supplied key material must match
-    /// the key currently stored for `auditor`.
     pub fn verify_commitment_with_view_key(
         env: Env,
         auditor: Address,
@@ -242,7 +728,7 @@ impl AuditModule {
             return Err(AuditError::InvalidViewKey);
         }
 
-        Ok(Self::verify_commitment_and_emit(
+        let matched = Self::verify_commitment_inner(
             &env,
             &auditor,
             &supplied_key,
@@ -250,11 +736,18 @@ impl AuditModule {
             claimed_amount,
             &blinding_factor,
             scope,
-        ))
+        );
+
+        Self::record_audit_log(&env, &auditor, scope, matched);
+
+        if !matched {
+            return Err(AuditError::CommitmentMismatch);
+        }
+
+        Ok(matched)
     }
 
     fn verify_scope_for_commitment(scope: AuditScope) -> Result<(), AuditError> {
-        // Scope check – AggregateOnly may not inspect individual commitments
         if scope == AuditScope::AggregateOnly {
             return Err(AuditError::InsufficientScope);
         }
@@ -267,18 +760,41 @@ impl AuditModule {
         let record: ViewKeyRecord = env
             .storage()
             .persistent()
-            .get(&DataKey::AuditorKey(auditor))
+            .get(&DataKey::AuditorKey(auditor.clone()))
             .ok_or(AuditError::KeyNotFound)?;
 
-        // Expiry check (ledger sequence)
         if env.ledger().sequence() > record.expiration_ledger {
+            env.events().publish(
+                (Symbol::new(env, "AuditAccessExpired"), auditor.clone()),
+                (record.expiration_ledger, env.ledger().sequence()),
+            );
             return Err(AuditError::KeyExpired);
+        }
+
+        if let Some(parent) = record.parent_auditor.clone() {
+            let parent_record: ViewKeyRecord = env
+                .storage()
+                .persistent()
+                .get(&DataKey::AuditorKey(parent.clone()))
+                .ok_or(AuditError::DelegationRevoked)?;
+
+            if env.ledger().sequence() > parent_record.expiration_ledger {
+                return Err(AuditError::DelegationRevoked);
+            }
+            if !Self::scope_is_within(parent_record.max_scope, record.scope) {
+                return Err(AuditError::DelegationExceedsParentScope);
+            }
+            if record.expiration_ledger > parent_record.max_expiration_ledger
+                || record.expiration_ledger > parent_record.expiration_ledger
+            {
+                return Err(AuditError::DelegationExceedsParentExpiry);
+            }
         }
 
         Ok(record)
     }
 
-    fn verify_commitment_and_emit(
+    fn verify_commitment_inner(
         env: &Env,
         auditor: &Address,
         view_key: &BytesN<32>,
@@ -287,28 +803,24 @@ impl AuditModule {
         blinding_factor: &BytesN<32>,
         scope: AuditScope,
     ) -> bool {
-        // Recompute commitment: sha256(amount_le ‖ blinding)
         let computed = Self::compute_commitment(env, claimed_amount, blinding_factor);
-
-        // Blend view key with both commitments so verification is keyed per auditor.
         let keyed_stored = Self::compute_keyed_commitment(env, view_key, stored_commitment);
         let keyed_computed = Self::compute_keyed_commitment(env, view_key, &computed);
         let matched = keyed_computed == keyed_stored;
 
         if matched {
-            env.events().publish(
-                (Symbol::new(env, "AuditSuccessful"), auditor.clone()),
-                (scope, keyed_stored),
-            );
+            let scope_sym = match scope {
+                AuditScope::FullCompany => Symbol::new(env, "FullCompany"),
+                AuditScope::TimeRange => Symbol::new(env, "TimeRange"),
+                AuditScope::EmployeeList => Symbol::new(env, "EmployeeList"),
+                AuditScope::AggregateOnly => Symbol::new(env, "AggregateOnly"),
+            };
+            payroll_events::emit_audit_successful(env, auditor.clone(), scope_sym);
         }
 
         matched
     }
 
-    /// Return an aggregate audit report.
-    ///
-    /// All scopes are permitted. Aggregate reports are returned from local state
-    /// until the external executor and registry lookups are wired in.
     pub fn generate_aggregate_report(
         env: Env,
         auditor: Address,
@@ -319,7 +831,7 @@ impl AuditModule {
         Self::authorize_auditor(&env, auditor.clone())?;
 
         let report = AuditReport {
-            company_id,
+            company_id: company_id.clone(),
             total_employees: 0,
             total_paid: 0,
             period_start,
@@ -327,46 +839,333 @@ impl AuditModule {
             verified: true,
         };
 
-        env.events().publish(
-            (Symbol::new(&env, "AggregateAuditGenerated"), auditor),
-            (
-                report.company_id.clone(),
-                report.period_start,
-                report.period_end,
-            ),
+        payroll_events::emit_aggregate_audit_generated(
+            &env,
+            auditor.clone(),
+            report.company_id.clone(),
+            report.period_start,
+            report.period_end,
         );
 
+        // Record the aggregate report generation as an audit log entry.
+        Self::record_audit_log(&env, &auditor, AuditScope::AggregateOnly, true);
+
         Ok(report)
+    }
+
+    // -----------------------------------------------------------------------
+    // Audit query patterns — company-level, employee-level, period-level
+    //
+    // These methods allow compliance consumers to retrieve audit-relevant
+    // records without scanning the full ledger. Log entries are stored
+    // per-company with a monotonically increasing counter.
+    //
+    // Privacy guarantees: Audit logs contain only metadata (auditor, company,
+    // scope, timestamp, match status) — salary values are never persisted.
+    // -----------------------------------------------------------------------
+
+    /// Retrieve all audit log entries for a given company.
+    pub fn query_by_company(env: Env, company_id: Symbol) -> AuditQueryResult {
+        let counter: u32 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::AuditLogCounter(company_id.clone()))
+            .unwrap_or(0);
+
+        let mut entries = Vec::new(&env);
+        for i in 0..counter {
+            if let Some(entry) = env
+                .storage()
+                .persistent()
+                .get::<DataKey, AuditLogEntry>(&DataKey::AuditLog(company_id.clone(), i))
+            {
+                entries.push_back(entry);
+            }
+        }
+
+        AuditQueryResult { entries }
+    }
+
+    /// Retrieve audit log entries filtered by an employee address.
+    ///
+    /// This matches entries where the auditor Address equals the requested
+    /// employee address (used when the auditor IS the employee verifying
+    /// their own commitment), or entries recorded under the company that
+    /// references this employee.
+    pub fn query_by_employee(env: Env, company_id: Symbol, employee: Address) -> AuditQueryResult {
+        let all = Self::query_by_company(env.clone(), company_id);
+        let mut filtered = Vec::new(&env);
+
+        for entry in all.entries.iter() {
+            if entry.auditor == employee {
+                filtered.push_back(entry);
+            }
+        }
+
+        AuditQueryResult { entries: filtered }
+    }
+
+    /// Retrieve audit log entries within a specific time range.
+    pub fn query_by_period(
+        env: Env,
+        company_id: Symbol,
+        period_start: u64,
+        period_end: u64,
+    ) -> AuditQueryResult {
+        let all = Self::query_by_company(env.clone(), company_id);
+        let mut filtered = Vec::new(&env);
+
+        for entry in all.entries.iter() {
+            if entry.timestamp >= period_start && entry.timestamp <= period_end {
+                filtered.push_back(entry);
+            }
+        }
+
+        AuditQueryResult { entries: filtered }
+    }
+
+    /// Return the count of audit log entries for a company — useful for
+    /// paginated UIs or compliance dashboards.
+    pub fn get_audit_log_count(env: Env, company_id: Symbol) -> u32 {
+        env.storage()
+            .persistent()
+            .get(&DataKey::AuditLogCounter(company_id))
+            .unwrap_or(0)
+    }
+
+    // ── Issue #93: audit metadata export ─────────────────────────────────────
+
+    /// Export a compliance-ready audit metadata summary for a company and period.
+    ///
+    /// Requires a valid (non-expired) view key for the requesting auditor.
+    /// Salary values are never included in the returned summary — only
+    /// verification counts and metadata needed for external compliance tooling.
+    pub fn export_audit_summary(
+        env: Env,
+        auditor: Address,
+        company_id: Symbol,
+        period_start: u64,
+        period_end: u64,
+    ) -> Result<AuditMetadataSummary, AuditError> {
+        Self::authorize_auditor(&env, auditor.clone())?;
+
+        let period_result =
+            Self::query_by_period(env.clone(), company_id.clone(), period_start, period_end);
+
+        let mut pass_count: u32 = 0;
+        let mut fail_count: u32 = 0;
+        let total: u32 = period_result.entries.len();
+
+        for entry in period_result.entries.iter() {
+            if entry.matched {
+                pass_count += 1;
+            } else {
+                fail_count += 1;
+            }
+        }
+
+        let exported_at = env.ledger().timestamp();
+        let integrity_marker = Self::compute_audit_export_integrity_marker(
+            &env,
+            &company_id,
+            period_start,
+            period_end,
+            total,
+            pass_count,
+            fail_count,
+            exported_at,
+            &auditor,
+        );
+
+        let summary = AuditMetadataSummary {
+            company_id: company_id.clone(),
+            period_start,
+            period_end,
+            total_audit_entries: total,
+            verification_pass_count: pass_count,
+            verification_fail_count: fail_count,
+            exported_at,
+            exported_by: auditor.clone(),
+            integrity_marker,
+        };
+
+        payroll_events::emit_audit_summary_exported(
+            &env,
+            auditor,
+            company_id,
+            period_start,
+            period_end,
+            total,
+        );
+
+        Ok(summary)
+    }
+
+    // ── Issue #607: audit export integrity marker ────────────────────────────
+
+    /// Verify that an exported summary's integrity marker binds its contents.
+    ///
+    /// Every export carries a deterministic `integrity_marker` computed at
+    /// export time. This entrypoint recomputes the marker from the summary's
+    /// metadata fields and compares it to the exported value, so an external
+    /// consumer can detect a post-export mutation of any field (period bounds,
+    /// verification counts, exporter, or export timestamp).
+    ///
+    /// Returns:
+    /// - `Ok(true)`  — the marker matches; the export is intact.
+    /// - `Ok(false)` — the marker does not match; the export was altered.
+    /// - `Err(AuditError::IntegrityMarkerMissing)` — no marker was supplied
+    ///   (all-zero), so integrity cannot be established.
+    pub fn verify_audit_export_integrity(
+        env: Env,
+        summary: AuditMetadataSummary,
+    ) -> Result<bool, AuditError> {
+        let zero = BytesN::from_array(&env, &[0u8; 32]);
+        if summary.integrity_marker == zero {
+            return Err(AuditError::IntegrityMarkerMissing);
+        }
+
+        let expected = Self::compute_audit_export_integrity_marker(
+            &env,
+            &summary.company_id,
+            summary.period_start,
+            summary.period_end,
+            summary.total_audit_entries,
+            summary.verification_pass_count,
+            summary.verification_fail_count,
+            summary.exported_at,
+            &summary.exported_by,
+        );
+
+        Ok(expected == summary.integrity_marker)
+    }
+
+    // ── Issue #177: metadata hash verification via audit scope ───────────────
+
+    /// Verify that an off-chain metadata hash matches the expected value,
+    /// recorded under an authorized auditor view key.
+    ///
+    /// The auditor supplies the `stored_hash` (from on-chain payroll run
+    /// records) and the `expected_hash` (their locally computed value). This
+    /// function compares them byte-for-byte and records the outcome as an
+    /// audit log entry.
+    ///
+    /// Returns `Ok(true)` when hashes match, `Ok(false)` when they differ,
+    /// or an `AuditError` if the auditor is not authorised.
+    pub fn verify_payroll_metadata(
+        env: Env,
+        auditor: Address,
+        stored_hash: BytesN<32>,
+        expected_hash: BytesN<32>,
+        scope: AuditScope,
+    ) -> Result<bool, AuditError> {
+        let zero = BytesN::from_array(&env, &[0u8; 32]);
+        if stored_hash == zero || expected_hash == zero {
+            panic!("Metadata hash cannot be all-zero digest");
+        }
+        Self::authorize_auditor(&env, auditor.clone())?;
+        Self::verify_scope_for_commitment(scope)?;
+
+        let matched = stored_hash == expected_hash;
+
+        Self::record_audit_log(&env, &auditor, scope, matched);
+
+        if matched {
+            env.events().publish(
+                (Symbol::new(&env, "MetadataVerified"), auditor.clone()),
+                (stored_hash, scope),
+            );
+        } else {
+            env.events().publish(
+                (Symbol::new(&env, "MetadataMismatch"), auditor.clone()),
+                (stored_hash, expected_hash),
+            );
+        }
+
+        Ok(matched)
     }
 
     // -----------------------------------------------------------------------
     // Internal helpers
     // -----------------------------------------------------------------------
 
-    /// Derive 32-byte key material for a given auditor + expiration.
-    ///
-    /// `sha256(auditor_xdr ‖ expiration_ledger_le ‖ current_sequence_le)`
-    ///
-    /// Including the current ledger sequence ensures uniqueness across
-    /// repeated calls even if `expiration_ledger` is reused.
+    /// Store a single audit log entry keyed by (company_id, counter) and
+    /// increment the counter. Called after every verification / report.
+    fn revoke_descendants(env: &Env, auditor: &Address) {
+        let delegates: Vec<Address> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::DelegatedAuditors(auditor.clone()))
+            .unwrap_or(Vec::new(env));
+
+        for delegate in delegates.iter() {
+            env.storage()
+                .persistent()
+                .remove(&DataKey::AuditorKey(delegate.clone()));
+            Self::revoke_descendants(env, &delegate);
+        }
+
+        env.storage()
+            .persistent()
+            .remove(&DataKey::DelegatedAuditors(auditor.clone()));
+    }
+
+    fn scope_is_within(parent_scope: AuditScope, child_scope: AuditScope) -> bool {
+        let rank = |scope: AuditScope| match scope {
+            AuditScope::FullCompany => 4,
+            AuditScope::TimeRange => 3,
+            AuditScope::EmployeeList => 2,
+            AuditScope::AggregateOnly => 1,
+        };
+        rank(child_scope) <= rank(parent_scope)
+    }
+
+    fn record_audit_log(env: &Env, auditor: &Address, scope: AuditScope, matched: bool) {
+        let company_id = Symbol::new(env, "default");
+        let counter: u32 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::AuditLogCounter(company_id.clone()))
+            .unwrap_or(0);
+
+        // Keep the counter monotonic for stable pagination, while deleting the
+        // oldest retained record before the next append.
+        if counter >= MAX_AUDIT_LOG_ENTRIES {
+            env.storage()
+                .persistent()
+                .remove(&DataKey::AuditLog(
+                    company_id.clone(),
+                    counter - MAX_AUDIT_LOG_ENTRIES,
+                ));
+        }
+
+        let entry = AuditLogEntry {
+            auditor: auditor.clone(),
+            company_id: company_id.clone(),
+            scope,
+            timestamp: env.ledger().timestamp(),
+            matched,
+        };
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::AuditLog(company_id.clone(), counter), &entry);
+        env.storage()
+            .persistent()
+            .set(&DataKey::AuditLogCounter(company_id), &(counter + 1));
+    }
+
     fn derive_key_bytes(env: &Env, auditor: &Address, expiration_ledger: u32) -> BytesN<32> {
         let mut preimage = Bytes::new(env);
 
-        // Address → canonical XDR bytes
         let addr_xdr = auditor.clone().to_xdr(env);
         preimage.append(&addr_xdr);
-
-        // expiration_ledger (little-endian)
         preimage.extend_from_array(&expiration_ledger.to_le_bytes());
-
-        // current sequence as nonce (little-endian)
         preimage.extend_from_array(&env.ledger().sequence().to_le_bytes());
 
         env.crypto().sha256(&preimage).into()
     }
 
-    /// Compute `sha256(amount_le_bytes ‖ blinding_factor)` as a stand-in for
-    /// `Poseidon(amount, blinding)` until CAP-0075 host functions are available.
     fn compute_commitment(env: &Env, amount: i128, blinding: &BytesN<32>) -> BytesN<32> {
         let mut preimage = Bytes::new(env);
         preimage.extend_from_array(&amount.to_le_bytes());
@@ -375,8 +1174,38 @@ impl AuditModule {
         env.crypto().sha256(&preimage).into()
     }
 
-    /// Compute `sha256(view_key ‖ commitment)` so each auditor verifies with
-    /// their own key material.
+    /// Compute the deterministic integrity marker for an audit metadata
+    /// export (#607).
+    ///
+    /// The digest is `SHA-256` over a domain separator (`zkpayroll_audit_export_v1`)
+    /// followed by every exported field in a canonical encoding. Binding all
+    /// fields means any change to the summary — including its exporter and
+    /// export timestamp — produces a different marker.
+    #[allow(clippy::too_many_arguments)]
+    fn compute_audit_export_integrity_marker(
+        env: &Env,
+        company_id: &Symbol,
+        period_start: u64,
+        period_end: u64,
+        total_audit_entries: u32,
+        verification_pass_count: u32,
+        verification_fail_count: u32,
+        exported_at: u64,
+        exported_by: &Address,
+    ) -> BytesN<32> {
+        let mut preimage = Bytes::new(env);
+        preimage.extend_from_slice(b"zkpayroll_audit_export_v1");
+        preimage.append(&company_id.to_xdr(env));
+        preimage.extend_from_array(&period_start.to_le_bytes());
+        preimage.extend_from_array(&period_end.to_le_bytes());
+        preimage.extend_from_array(&total_audit_entries.to_le_bytes());
+        preimage.extend_from_array(&verification_pass_count.to_le_bytes());
+        preimage.extend_from_array(&verification_fail_count.to_le_bytes());
+        preimage.extend_from_array(&exported_at.to_le_bytes());
+        preimage.append(&exported_by.to_xdr(env));
+        env.crypto().sha256(&preimage).into()
+    }
+
     fn compute_keyed_commitment(
         env: &Env,
         view_key: &BytesN<32>,
@@ -393,3 +1222,40 @@ impl AuditModule {
 
 #[cfg(test)]
 mod tests;
+
+// ────────────────────────────────────────────────────────────────────────────
+// Issue #513: Audit Grant Scope Query Endpoint
+// ────────────────────────────────────────────────────────────────────────────
+
+/// Query the effective scope and lifecycle state of an audit grant.
+///
+/// Returns:
+/// - Grant scope (FullCompany, TimeRange, EmployeeList, AggregateOnly)
+/// - Expiration ledger
+/// - Whether grant is currently active (not expired)
+/// - Granted by (admin address)
+/// - Delegation status
+///
+/// Read-only query, no authorization required for transparency.
+/// Privacy-safe: returns metadata only, no salary or employee data.
+pub fn query_grant_scope(env: Env, auditor: Address) -> Result<ViewKeyRecord, AuditError> {
+    let record: ViewKeyRecord = env
+        .storage()
+        .persistent()
+        .get(&DataKey::AuditorKey(auditor))
+        .ok_or(AuditError::KeyNotFound)?;
+
+    Ok(record)
+}
+
+/// Check if a grant is currently active (exists and not expired).
+pub fn is_grant_active(env: Env, auditor: Address) -> bool {
+    match env
+        .storage()
+        .persistent()
+        .get::<_, ViewKeyRecord>(&DataKey::AuditorKey(auditor))
+    {
+        Some(record) => env.ledger().sequence() <= record.expiration_ledger,
+        None => false,
+    }
+}

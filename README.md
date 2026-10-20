@@ -10,8 +10,17 @@ ZK Payroll Contracts enable companies to process payroll on-chain while keeping 
 
 - **Private Salary Commitments** — Salary amounts stored as ZK commitments
 - **Proof-Based Payments** — Verify payments without exposing values
+- **Employee Identifier Normalization** — Canonical trimming, ASCII uppercasing, and validation for safe HR reference lookups and collision prevention
+- **Commitment Rotation Controls** — Approved (locked) salary commitments can be rotated in place after a payroll settles, without invalidating the settled record and without an unlock window
 - **Batch Payroll** — Process multiple employees in single transaction
+- **Period Freeze Guard** — Finalized payroll periods are locked against further edits, with an admin-controlled unfreeze path for authorized corrections
+- **Run Expiration** — Prepared-but-unfinalized payroll runs can expire after a configurable window, releasing reserved funds and stopping stale submissions
+- **Draft Lock Owner Query** — Query the lock holder for finalized drafts without exposing private employee counts or amounts
+- **Execution Initiator Authorization** — Every payroll preparation/execution path validates that its initiator is the registered admin, with a read-only preflight for SDKs and dashboards
+- **Duplicate Execution Guard** — Payroll runs cannot be executed twice; a second execution attempt fails with an actionable error without exposing salary or employee values
 - **Compliance Ready** — Selective disclosure for audits via view keys
+- **Audit Export Integrity** — Exported compliance summaries carry a deterministic integrity marker so tampering after export is detectable (#607)
+- **Approved Payroll Revision Protection** — Multi-stage draft approvals are bound to the revision's protected content hash; revising protected fields rolls the approvals back (#616)
 - **On-Chain Verification** — Groth16 proof verification on Soroban
 
 ## Architecture
@@ -44,6 +53,39 @@ ZK Payroll Contracts enable companies to process payroll on-chain while keeping 
 | `proof_verifier` | Groth16 proof verification using BN254 |
 | `payment_executor` | Private payment execution |
 | `audit_module` | Selective disclosure for compliance |
+
+> **Period lifecycle:** finalized payroll periods are protected by a freeze
+> guard (#471) — see [docs/period-freeze-guard.md](docs/period-freeze-guard.md)
+> for what is blocked, the escape hatches, and the authorized correction flow.
+>
+> **Run lifecycle:** prepared-but-unfinalized runs can expire (#474) — see
+> [docs/run-expiration.md](docs/run-expiration.md) for the expiry policy, the
+> permissionless expiry flow, and SDK guidance.
+>
+<> **Commitment lifecycle:** an approved or settled commitment can be rotated
+> with `rotate_approved_commitment` without dropping its lock (#520) — see
+> [contracts/README.md](contracts/README.md#commitment-rotation-controls-salary_commitment--issue-520).
+>
+> **Duplicate execution guard:** a payroll run can only be executed once. A
+> repeated execution attempt is rejected with an actionable error and never
+> exposes salary, employee, or commitment values.
+>
+> **Role lifecycle:** privileged role transfers require an explicit acceptance
+> from the pending recipient and cannot activate before the acceptance delay
+> elapses (#507) — see
+> [docs/role-transfer-acceptance-delay.md](docs/role-transfer-acceptance-delay.md)
+> for the delay, the privacy-safe status views, and SDK guidance.
+>
+> **Audit exports:** exported compliance summaries carry a deterministic
+> integrity marker that integrators verify before trusting the export (#607) —
+> see [docs/audit-export-integrity.md](docs/audit-export-integrity.md) for the
+> marker formula and verification semantics.
+>
+> **Payroll revisions:** multi-stage draft approvals are bound to the revision's
+> protected content hash; a revision rolls them back rather than letting a stale
+> approval through (#616) — see
+> [docs/approved-payroll-revision-protection.md](docs/approved-payroll-revision-protection.md)
+> for the protected fields, failure messages, and rollback semantics.
 
 ## Prerequisites
 
@@ -100,6 +142,77 @@ payroll_registry.register_company(
 
 ## Usage
 
+### Versioned Admin Configuration Updates
+
+The payroll registry now tracks configuration revisions so off-chain clients can detect changes reliably. Each company maintains a version counter that increments whenever admin or treasury configuration changes.
+
+```rust
+// Get current admin configuration version
+let version = payroll_registry.get_admin_config_version(company_id);
+// Returns: AdminConfigVersion { version: u64, updated_at: u64, updated_by: Address }
+
+// The version automatically increments on admin/treasury rotations
+payroll_registry.propose_admin_rotation(company_id, current_admin, new_admin);
+payroll_registry.accept_admin_rotation(company_id, new_admin);
+// Version now incremented to previous_version + 1
+```
+
+**Key Guarantees:**
+- **Version Tracking**: Each company starts at version 1 when registered
+- **Automatic Incrementing**: Version increments on admin or treasury rotation acceptance
+- **Change Detection**: Off-chain clients can poll the version to detect configuration changes
+- **Event Emission**: `AdminConfigVersionUpdated` events are emitted for reliable change notification
+- **Backward Compatible**: Existing operations continue to work without changes
+
+### Payroll Configuration Audit Events
+
+Every successful configuration change on the `payroll` contract publishes one
+`("payroll", "config_changed", key)` event and bumps a contract-wide revision
+(#490). This covers admin and treasury-owner handoffs, pause manager, asset
+allowlist, company state, capacity limits, settlement windows, period freezes,
+retention policy, reviewers, dispute authorities, reservation expiry, payroll
+currency, and storage version.
+
+```rust
+// data = (actor, subject_ref, previous_ref, new_ref, revision, ledger_sequence, timestamp)
+payroll.set_capacity_limits(&admin, &10, &100, &1_000_000);
+let revision = payroll.get_config_revision(); // 1, 2, 3, ... with no gaps
+```
+
+- **Actor:** the address whose authorization the change required (checked
+  against the stored role).
+- **Value references:** `sha256` of each value's canonical XDR; 32 zero bytes
+  mean "no value". Consecutive changes chain (`previous_ref` = prior
+  `new_ref`).
+- **Privacy:** configuration values are never emitted in plaintext, and no
+  salary, employee, or commitment data is involved.
+- **No-op / failed changes:** no audit event and no revision bump.
+
+See [docs/config-audit-events.md](docs/config-audit-events.md) for the schema,
+key table, and how to verify a reference.
+
+### Payroll Period Health Summary
+
+The `payroll` contract exposes `get_period_health_summary` to provide operators and monitoring dashboards with actionable operational readiness diagnostics without leaking private employee identities or individual salary information (#552).
+
+```rust
+let summary = payroll.get_period_health_summary(&period);
+// summary.status: PeriodHealthStatus (Healthy, Warning, Blocked)
+// summary.reason: PeriodHealthReason (Normal, PreOpen, GracePeriod, WindowClosed, ContractPaused, PeriodFrozen, ...)
+// summary.can_execute: bool
+// summary.is_frozen: bool
+// summary.is_paused: bool
+// summary.window_status: Option<SettlementWindowStatus>
+// summary.capacity_configured: bool
+// summary.batch_count: u32
+// summary.employee_count: u32
+// summary.capacity_exceeded: bool
+```
+
+- **Operational Health**: Classifies periods into `Healthy` (ready for execution), `Warning` (grace period, frozen configuration), or `Blocked` (paused, closed window, capacity exhausted).
+- **Actionable Diagnostics**: Clear, typed reason codes indicate exact blockers or operational alerts (e.g., `PreOpen`, `ContractPaused`, `BatchCapacityExceeded`).
+- **Privacy Guarantees**: Plaintext salaries, employee commitments, and individual recipient rows are never exposed.
+
 ### Register Employee with Private Salary
 
 ```rust
@@ -113,6 +226,25 @@ payroll_registry.add_employee(
     salary_commitment
 );
 ```
+
+### Employer Access Revocation
+
+An authorized company admin may revoke the company's employer/admin authorization without deleting the company record or historical payroll state. Revocation marks the company as revoked in the canonical registry state, removes the active employer mapping, and blocks subsequent employer-only actions such as employee onboarding, employee status updates, and payroll-period setup for that company.
+
+Existing payroll history remains intact; only the employer authorization is lifted. A revoked employer cannot call employer-only entrypoints until the canonical role state is restored through the repository's existing admin/rotation flows.
+
+### Approval Withdrawal and Supersession
+
+Payroll run approvals recorded by authorized reviewers are fully auditable
+through their full lifecycle (#522). A reviewer who granted the active
+approval may withdraw it with a mandatory, non-empty reason; the stored review
+transitions to a `Withdrawn` decision so expiry validation (#403) and approval
+consumers no longer treat the run as approved. A different authorized reviewer
+can supersede an existing approval, re-pointing the approval at themselves and
+restarting the #403 expiry window. Every withdrawal and supersession emits a
+privacy-safe `payroll` event (`run_approval_withdrawn` /
+`run_approval_superseded`) carrying only the run id, reviewer addresses, and a
+short reason symbol — never salary values or employee data.
 
 ### Process Private Payroll
 
@@ -132,12 +264,140 @@ payment_executor.process_payment(
 );
 ```
 
-The `payroll` contract can use an admin-configured fallback treasury when the
-primary treasury cannot cover an individual payment. Configure it with
-`configure_fallback_treasury(fallback_address)`; the fallback must be a
-different address and already hold the required payment tokens. Payments use
-the primary treasury whenever it can cover them, and otherwise use the fallback.
-If neither source can cover a payment, the batch fails atomically.
+### Payroll Approval Threshold
+
+Employers can require a configurable number of distinct reviewers to approve a
+prepared payroll run before it executes. The policy is opt-in: without it,
+`finalize_payroll_run` behaves exactly as before.
+
+```rust
+// Admin: require 2 of the authorized reviewers (needs >= 2 reviewers, max 10).
+payroll.set_approval_threshold(&admin, &2);
+
+let run_id = payroll.prepare_payroll_run(&proofs, &amounts, &employees, &total, &nonce, &None);
+payroll.approve_payroll_run(&reviewer_a, &run_id);
+payroll.approve_payroll_run(&reviewer_b, &run_id);
+
+// progress.required == 2, progress.approved == 2, progress.threshold_met == true
+let progress = payroll.get_approval_progress(&run_id);
+payroll.finalize_payroll_run(&admin, &run_id);
+```
+
+- **Counted approvals**: one per reviewer; an approval stops counting when it
+  expires (`DEFAULT_APPROVAL_EXPIRY_SECONDS`) or its reviewer is removed.
+- **Objections reset the quorum**: `reject_payroll_run` and
+  `request_changes_payroll_run` clear all recorded approvals for the run.
+- **Withdrawal and supersession**: `withdraw_approval` removes only the
+  withdrawing reviewer's approval; `supersede_approval` moves the approval to
+  the superseding reviewer (who must not already have approved).
+- **Direct execution is disabled** while a threshold is set:
+  `batch_process_payroll*` and `batch_process_with_expiry` fail and the dry-run reports
+  `ApprovalWorkflowRequired`. Use prepare → approve → finalize instead.
+- **Locked during in-flight runs**: the threshold cannot be changed or cleared
+  (`clear_approval_threshold`) while any run is pending.
+- **Privacy**: failures report only approval counts, never amounts or employees.
+
+See [docs/security/reviewer-authorization.md](docs/security/reviewer-authorization.md#24-payroll-approval-threshold)
+for the full rules and failure messages.
+
+### Employee Payout Destination Updates
+
+Employees can securely manage and update their payment receiving addresses:
+
+```rust
+// Update payout destination (requires employee authorization)
+payroll_registry.update_payout_destination(
+    company_id,
+    employee_address,
+    new_destination_address
+);
+
+// Update payout destination using wallet string (validates format/checksum)
+payroll_registry.update_payout_destination_wallet(
+    company_id,
+    employee_address,
+    wallet_string
+);
+
+// Retrieve current payout destination (defaults to employee address if unset)
+let destination = payroll_registry.get_payout_destination(company_id, employee_address);
+```
+
+**Key Guarantees:**
+- **Authorization**: Only the employee (`employee.require_auth()`) can modify their own destination.
+- **Validations**: Rejects zero-address (`GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF`), existing duplicate destination on file, or invalid Stellar wallet formatting.
+- **Isolation**: Pending/in-flight payroll runs retain their original snapshot parameters, isolating existing runs from destination updates.
+
+### Bounded Batch Payroll Processing
+
+Process large employee pools across multiple bounded transactions:
+
+```rust
+// Process a bounded batch (up to 50 employees per batch)
+let processed_count = payroll.batch_process_payroll_bounded(
+    company_id,
+    run_id,
+    batch_size // Max 50
+);
+```
+
+**Key Guarantees:**
+- **Hard Cap**: Strictly limits `batch_size <= 50` to prevent gas exhaustion and block limit failures.
+- **Progress Tracking**: Tracks `BatchCheckpoint` state (`processed_count` out of `total_count`). Resumption starts at `last_processed_index` without double payments.
+- **Halt-on-Error**: Halts and rolls back state atomically if any single employee payment or proof fails.
+- **Authorization**: Requires operator/admin authorization (`admin.require_auth()`). Rejects empty batch parameters.
+
+For a failed bounded payout checkpoint, first call
+`is_failed_payout_retry_eligible` with the original batch identity and payment
+count. If it returns `true`, the admin can call `resume_failed_payout_retry`
+with the saved checkpoint index, then retry the same batch with the same nonce.
+Completed checkpoints and checkpoints with no remaining payments are rejected.
+The eligibility check returns only a boolean and does not reveal employee or
+salary values. See [Payroll Run State Machine](docs/payroll-state-machine.md)
+for the recovery steps.
+
+#### Resuming a halted batch (issue #611)
+
+When a bounded batch halts, the checkpoint is left in the `Failed` state and
+further batches for the same run are rejected with a message naming
+`resume_payroll_batch`. Inspect the checkpoint before acting on it:
+
+```rust
+let plan = payroll.get_batch_resume_plan(
+    company_id,
+    batch_root,
+    asset,
+    execution_nonce,
+    expected_total,
+);
+// plan.status      -> NotFound | Resumable | FailedRetryable | Completed
+// plan.can_resume  -> true only when a partial, non-failed checkpoint exists
+// plan.remaining_count
+// plan.cursor_consistent
+```
+
+Then, as admin, clear the failure and continue from the recorded cursor:
+
+```rust
+payroll.resume_payroll_batch(
+    admin,
+    employer,
+    batch_root,
+    asset,
+    execution_nonce,
+    expected_total,
+);
+```
+
+`get_batch_resume_plan` is read-only and returns aggregate progress only — no
+employee addresses, amounts, or salary values. It reports `NotFound` when the
+batch identity is unknown or when `expected_total` is `0` or above the 50-employee
+cap, so an operator cannot use it to probe for payroll sizes outside the bounds
+the contract accepts. Resuming sets the checkpoint back to `Resumed`, clears the
+recorded failure, and emits `batch_checkpoint_resumed`; the next
+`batch_process_payroll_bounded` call continues at the stored index without
+re-paying the already processed employees. Resuming an already completed batch
+panics with an actionable message rather than silently re-running payments.
 
 ### Compliance Audit
 
@@ -217,6 +477,88 @@ This project leverages Stellar's Protocol X-Ray (Protocol 25) primitives:
 - [ ] Batch payment optimization
 - [ ] Multi-currency support
 
+## SDK Contract Interface
+
+See [docs/sdk-contract-interface.md](docs/sdk-contract-interface.md) for a
+flow-oriented guide covering company setup, employee onboarding, payroll
+execution, and audit access — with sample payloads and input/output tables.
+
+## Events
+
+See [docs/events.md](docs/events.md) for the full event schema reference and
+consumption expectations.
+
+## Clock Boundary Testing
+
+The contracts include comprehensive clock boundary tests to ensure timestamp-based cutoff mechanisms work correctly at exact boundaries and adjacent edge cases. These tests improve reliability of time-sensitive payroll operations:
+
+### Boundary Test Coverage
+
+- **Settlement Window Enforcement** (`contracts/payroll/tests/settlement_window_enforcement.rs`)
+  - Exact boundary tests for `open_at`, `execution_start`, `execution_end`, and `close_at` timestamps
+  - Adjacent boundary cases (one tick before/after each cutoff)
+  - Mid-period and mid-grace period validations
+  - Grace period cancellation and expiration at boundaries
+
+- **Approval Expiry** (`contracts/payroll/tests/approval_expiry.rs`)
+  - Exact expiry boundary validation
+  - One tick before/after expiry cases
+  - Custom expiry period boundaries
+  - Multiple approvals with different timestamps
+
+- **Threshold Rotation Grace Periods** (`contracts/payroll_registry/tests/threshold_rotation_boundary_tests.rs`)
+  - Exact grace period boundary activation
+  - Adjacent timestamp validation for rotation proposals
+  - Zero grace period edge cases
+  - Cancellation before/after grace period boundaries
+
+- **Reservation Expiry** (`contracts/payroll/tests/reservation_expiry_boundary_tests.rs`)
+  - Exact expiry boundary release operations
+  - One tick before/after expiry validation
+  - Zero and large expiry offset edge cases
+  - Multiple reservations with different expiry times
+
+### Running Boundary Tests
+
+```bash
+# Run all boundary tests
+cargo test --test settlement_window_enforcement
+cargo test --test approval_expiry
+cargo test --test threshold_rotation_boundary_tests
+cargo test --test reservation_expiry_boundary_tests
+```
+
+These boundary tests ensure that payroll cutoffs work reliably at exact timestamps and prevent edge case failures in production.
+
+## Local Setup & Test Troubleshooting
+
+See [contracts/README.md](contracts/README.md) for **environment variables**, local test setup expectations, and a quick manual verification checklist.
+
+See [contracts/tests/README.md](contracts/tests/README.md) for common local setup issues, test panics, missing WASM fixture errors, and ZK proof setup troubleshooting.
+
+## Contract Error Handling
+
+See [docs/errors.md](docs/errors.md) for common contract failure modes,
+retryability guidance, and suggested SDK/dashboard recovery messages.
+
+## Contract Upgrades
+
+Before activating an upgraded contract implementation, validate that the data
+already on chain is still compatible. `payment_executor` exposes a read-only,
+admin-gated preflight that reports schema versions and readiness flags, and
+fails with a typed storage error when an activation should be blocked. The
+report never includes salaries, commitments, employee addresses, or amounts.
+
+See [docs/upgrades.md](docs/upgrades.md#34-pre-activation-compatibility-check) for
+the procedure and remediation table, and
+[docs/architecture/storage-key-versioning.md](docs/architecture/storage-key-versioning.md)
+for the versioning strategy.
+
+## Deployment Verification Checklist
+
+See [docs/deployment-verification.md](docs/deployment-verification.md) for a comprehensive checklist covering contract IDs, target network configuration, ZK verifier parameters, treasury setup, admin roles, and post-deploy smoke tests.
+
+
 ## Contributing
 
 We welcome contributions! Please see [CONTRIBUTING.md](CONTRIBUTING.md) for guidelines.
@@ -233,3 +575,20 @@ MIT License — see [LICENSE](LICENSE) for details.
 
 - [Stellar Development Foundation](https://stellar.org) — Protocol X-Ray ZK primitives
 - [Nethermind](https://nethermind.io) — ZK tooling collaboration
+
+### Signed Payroll Approvals & Nonce Mechanics
+
+To protect against replay attacks, approvals require an incrementing `u64` nonce bound to each `(payroll_id, approver)` pair.
+
+#### Querying Nonce
+Before requesting an approver's signature, query the current expected nonce via RPC:
+
+json
+{
+"method": "get_approver_nonce",
+"args": ["<payroll_id_bytes32>", "<approver_address>"]
+}
+
+
+#### Error Codes
+* `ApprovalError::InvalidNonce (1)`: Nonce mismatch (replayed signature or out-of-order request). Re-query current nonce and sign again.

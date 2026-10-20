@@ -1,5 +1,14 @@
 #![no_std]
 
+// Fixture datasets for local testing — Issue #81.
+// Provides deterministic test data for companies, employees, and payroll periods.
+#[cfg(test)]
+mod fixtures;
+
+// Upgrade simulation tests — Issue #108.
+#[cfg(test)]
+mod upgrade_simulation;
+
 // Proof generation helper — only compiled in test mode.
 // Provides `try_generate_proof` which spawns `node generate_proof.js` and
 // parses the output into Soroban-compatible byte arrays.
@@ -27,7 +36,7 @@ mod e2e {
     use salary_commitment::{SalaryCommitmentContract, SalaryCommitmentContractClient};
     use soroban_sdk::{
         testutils::{Address as _, Events},
-        Address, BytesN, Env, Vec,
+        Address, BytesN, Env, Symbol, TryIntoVal, Vec,
     };
     use token::{Token, TokenClient};
 
@@ -57,6 +66,13 @@ mod e2e {
         BytesN::from_array(env, &[0u8; 256])
     }
 
+    /// Generates a unique 32-byte nonce from a counter seed for tests.
+    fn test_nonce(env: &Env, seed: u8) -> BytesN<32> {
+        let mut arr = [0u8; 32];
+        arr[0] = seed;
+        BytesN::from_array(env, &arr)
+    }
+
     /// Compute the salary commitment used across tests.
     ///
     /// In production this will use the Poseidon host function (CAP-0075).
@@ -72,7 +88,6 @@ mod e2e {
     }
 
     // ── Helper: register & initialise all five contracts ─────────────────────
-
     struct TestContext<'a> {
         env: Env,
         admin: Address,
@@ -90,11 +105,19 @@ mod e2e {
         env.mock_all_auths();
 
         // ── Register contracts ───────────────────────────────────────────────
+        let admin = Address::generate(&env);
+        let treasury = Address::generate(&env);
+        let treasury_owner = Address::generate(&env);
+        let alice = Address::generate(&env);
+
         let verifier_id = env.register_contract(None, ProofVerifier);
         let verifier_client = ProofVerifierClient::new(&env, &verifier_id);
+        verifier_client.init_verifier_admin(&admin);
         verifier_client.initialize_verifier(&mock_vk(&env));
 
         let commitment_id = env.register_contract(None, SalaryCommitmentContract);
+        let commitment_client_init = SalaryCommitmentContractClient::new(&env, &commitment_id);
+        commitment_client_init.init_commitment_admin(&admin);
 
         let token_id = env.register_contract(None, Token);
 
@@ -102,14 +125,19 @@ mod e2e {
 
         let payroll_id = env.register_contract(None, Payroll);
 
-        // ── Actors ────────────────────────────────────────────────────────────
-        let admin = Address::generate(&env);
-        let treasury = Address::generate(&env);
-        let alice = Address::generate(&env);
-
         // ── Initialise payroll executor ───────────────────────────────────────
         let payroll_client = PayrollClient::new(&env, &payroll_id);
-        payroll_client.initialize(&admin, &token_id, &verifier_id, &commitment_id, &treasury);
+        payroll_client.initialize(
+            &admin,
+            &token_id,
+            &verifier_id,
+            &commitment_id,
+            &treasury,
+            &treasury_owner,
+        );
+
+        let commitment_client_init = SalaryCommitmentContractClient::new(&env, &commitment_id);
+        commitment_client_init.set_payroll_operator(&payroll_id);
 
         // ── Build typed clients ───────────────────────────────────────────────
         let token_client = TokenClient::new(&env, &token_id);
@@ -174,8 +202,14 @@ mod e2e {
 
         // Execute batch payroll: verifier checks proof, commitment is retrieved,
         // nullifier is recorded, and the token transfer is executed.
-        ctx.payroll_client
-            .batch_process_payroll(&proofs, &amounts, &employees, &payment_amount);
+        ctx.payroll_client.batch_process_payroll(
+            &proofs,
+            &amounts,
+            &employees,
+            &payment_amount,
+            &test_nonce(env, 1),
+            &None,
+        );
 
         // ── ASSERTIONS ────────────────────────────────────────────────────────
 
@@ -200,14 +234,84 @@ mod e2e {
             "Payment nullifier must be recorded after execution"
         );
 
-        // 4. Exactly two events must have been emitted across the full flow:
-        //      - `CommitmentUpdated` from salary_commitment.store_commitment (onboarding)
-        //      - `payment_executed`  from payroll.batch_process_payroll    (execution)
+        // 4. Events must have been emitted across the full flow:
+        //      - `CompanyRegistered`  from payroll_registry.register_company (setup)
+        //      - `CommitmentUpdated`  from salary_commitment.store_commitment (onboarding)
+        //      - `EmployeeAdded`      from payroll_registry.add_employee    (onboarding)
+        //      - `CommitmentLocked`   from salary_commitment.lock_commitment_updates (execution)
+        //      - `payment_executed`   from payroll.batch_process_payroll     (execution)
+        //      - `run_executed`       from payroll.batch_process_payroll     (execution)
         let events = env.events().all();
-        assert_eq!(
-            events.len(),
-            2,
-            "Expected 2 events: CommitmentUpdated (onboarding) + payment_executed (execution)"
+        let mut has_company = false;
+        let mut has_commitment = false;
+        let mut has_employee = false;
+        let mut has_payment = false;
+
+        for event in events.iter() {
+            let topics = event.1;
+            if !topics.is_empty() {
+                if let Ok(sym) = topics.get(0).unwrap().try_into_val(&env.clone()) {
+                    let sym: Symbol = sym;
+                    if sym == Symbol::new(env, "CompanyRegistered") {
+                        has_company = true;
+                    } else if sym == Symbol::new(env, "CommitmentUpdated") {
+                        has_commitment = true;
+                    } else if sym == Symbol::new(env, "EmployeeAdded") {
+                        has_employee = true;
+                    } else if sym == Symbol::new(env, "payroll") && topics.len() > 1 {
+                        if let Ok(sub_sym) = topics.get(1).unwrap().try_into_val(&env.clone()) {
+                            let sub_sym: Symbol = sub_sym;
+                            if sub_sym == Symbol::new(env, "payment_executed") {
+                                has_payment = true;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        assert!(has_company, "CompanyRegistered event missing");
+        assert!(has_commitment, "CommitmentUpdated event missing");
+        assert!(has_employee, "EmployeeAdded event missing");
+        assert!(has_payment, "payment_executed event missing");
+        assert!(events.len() >= 6, "Expected at least 6 events emitted");
+
+        let has_event = |sym: &str| {
+            events.iter().any(|e| {
+                e.1.iter().any(|val| {
+                    if let Ok(s) = val.try_into_val(env) {
+                        let symbol: Symbol = s;
+                        symbol == Symbol::new(env, sym)
+                    } else {
+                        false
+                    }
+                })
+            })
+        };
+
+        assert!(
+            has_event("CompanyRegistered"),
+            "CompanyRegistered event must be emitted"
+        );
+        assert!(
+            has_event("CommitmentUpdated"),
+            "CommitmentUpdated event must be emitted"
+        );
+        assert!(
+            has_event("EmployeeAdded"),
+            "EmployeeAdded event must be emitted"
+        );
+        assert!(
+            has_event("CommitmentLocked"),
+            "CommitmentLocked event must be emitted"
+        );
+        assert!(
+            has_event("payment_executed"),
+            "payment_executed event must be emitted"
+        );
+        assert!(
+            has_event("run_executed"),
+            "run_executed event must be emitted"
         );
     }
 
@@ -293,8 +397,14 @@ mod e2e {
         let mut employees = Vec::new(env);
         employees.push_back(ctx.alice.clone());
 
-        ctx.payroll_client
-            .batch_process_payroll(&proofs, &amounts, &employees, &5_000i128);
+        ctx.payroll_client.batch_process_payroll(
+            &proofs,
+            &amounts,
+            &employees,
+            &5_000i128,
+            &test_nonce(env, 2),
+            &None,
+        );
     }
 
     /// Running payroll twice for the same employee reuses the nullifier and must panic.
@@ -325,13 +435,25 @@ mod e2e {
 
         // First payroll run succeeds.
         let (proofs, amounts, employees) = make_batch(env, &ctx.alice);
-        ctx.payroll_client
-            .batch_process_payroll(&proofs, &amounts, &employees, &5_000i128);
+        ctx.payroll_client.batch_process_payroll(
+            &proofs,
+            &amounts,
+            &employees,
+            &5_000i128,
+            &test_nonce(env, 3),
+            &None,
+        );
 
         // Second payroll run with the same nullifier (batch index 0) must panic.
         let (proofs2, amounts2, employees2) = make_batch(env, &ctx.alice);
-        ctx.payroll_client
-            .batch_process_payroll(&proofs2, &amounts2, &employees2, &5_000i128);
+        ctx.payroll_client.batch_process_payroll(
+            &proofs2,
+            &amounts2,
+            &employees2,
+            &5_000i128,
+            &test_nonce(env, 4),
+            &None,
+        );
     }
 
     /// Array length mismatches must be rejected immediately.
@@ -353,11 +475,109 @@ mod e2e {
         employees.push_back(ctx.alice.clone());
         employees.push_back(ctx.alice.clone());
 
-        ctx.payroll_client
-            .batch_process_payroll(&proofs, &amounts, &employees, &5_000i128);
+        ctx.payroll_client.batch_process_payroll(
+            &proofs,
+            &amounts,
+            &employees,
+            &5_000i128,
+            &test_nonce(env, 5),
+            &None,
+        );
     }
 
     // ── Dynamic proof generation test ─────────────────────────────────────────
+
+    // ── Employee deactivation & payroll exclusion coverage ────────────────────
+
+    /// Demonstrates the payroll exclusion GAP: deactivating an employee in the
+    /// registry does NOT prevent the payroll contract from paying them.
+    ///
+    /// The `batch_process_payroll` function never queries `is_eligible()` from
+    /// the payroll registry.  As a result, an employee whose status has been set
+    /// to `Inactive` can still receive payment via the payroll contract.
+    ///
+    /// This test documents the gap explicitly rather than silently fixing it.
+    /// The registry-level `is_eligible()` correctly returns `false`, but the
+    /// payroll execution layer never calls it.
+    #[test]
+    fn test_inactive_employee_still_paid_by_payroll_gap() {
+        let ctx = setup();
+        let env = &ctx.env;
+
+        // ── Onboard Alice normally ───────────────────────────────────────────
+        let commitment = alice_salary_commitment(&ctx.commitment_client);
+        ctx.commitment_client
+            .store_commitment(&ctx.alice, &commitment);
+        ctx.registry_client
+            .add_employee(&ctx.company_id, &ctx.alice, &commitment);
+
+        // ── Deactivate Alice in the registry ─────────────────────────────────
+        ctx.registry_client.set_employee_status(
+            &ctx.company_id,
+            &ctx.alice,
+            &payroll_registry::EmployeeStatus::Inactive,
+        );
+
+        // Verify the registry correctly marks her as ineligible.
+        assert!(
+            !ctx.registry_client.is_eligible(&ctx.company_id, &ctx.alice),
+            "Registry must report deactivated employee as ineligible"
+        );
+
+        // ── Fund treasury and attempt payroll execution ──────────────────────
+        let initial_treasury: i128 = 10_000;
+        let payment_amount: i128 = 5_000;
+        ctx.token_client.mint(&ctx.treasury, &initial_treasury);
+
+        let mut proofs = Vec::new(env);
+        proofs.push_back(mock_proof(env));
+        let mut amounts = Vec::new(env);
+        amounts.push_back(payment_amount);
+        let mut employees = Vec::new(env);
+        employees.push_back(ctx.alice.clone());
+
+        // Execute payroll — this DOES NOT revert, proving the gap.
+        ctx.payroll_client.batch_process_payroll(
+            &proofs,
+            &amounts,
+            &employees,
+            &payment_amount,
+            &test_nonce(env, 7),
+            &None,
+        );
+
+        // ── Despite being inactive, Alice received the full payment ──────────
+        assert_eq!(
+            ctx.token_client.balance(&ctx.treasury),
+            initial_treasury - payment_amount,
+            "GAP: Treasury decreased even though Alice was deactivated"
+        );
+        assert_eq!(
+            ctx.token_client.balance(&ctx.alice),
+            payment_amount,
+            "GAP: Deactivated Alice received payment"
+        );
+
+        // ── Verify the payment event was emitted for the inactive employee ────
+        let events = env.events().all();
+        // Expected events: CompanyRegistered, CommitmentUpdated, EmployeeAdded,
+        //   payment_executed, run_executed  (= 5 events total)
+        assert_eq!(
+            events.len(),
+            5,
+            "GAP: payment_executed event emitted for inactive employee"
+        );
+
+        let topics3 = events.get(3).unwrap().1;
+        let evt_sym0: Symbol = topics3.get(0).unwrap().try_into_val(&env.clone()).unwrap();
+        assert_eq!(evt_sym0, Symbol::new(env, "payroll"));
+        let evt_sym1: Symbol = topics3.get(1).unwrap().try_into_val(&env.clone()).unwrap();
+        assert_eq!(
+            evt_sym1,
+            Symbol::new(env, "payment_executed"),
+            "GAP: payment_executed event fired for inactive employee"
+        );
+    }
 
     /// Tests the full proof-generation pipeline using a dynamically generated proof.
     ///
@@ -400,8 +620,6 @@ mod e2e {
         let proof = BytesN::from_array(env, &proof_bytes);
         let salary_commitment = BytesN::from_array(env, &proof_data.salary_commitment);
 
-        ctx.registry_client
-            .register_company(&ctx.admin, &ctx.treasury);
         ctx.commitment_client
             .store_commitment(&ctx.alice, &salary_commitment);
         ctx.registry_client
@@ -418,8 +636,14 @@ mod e2e {
         amounts.push_back(payment_amount);
         employees.push_back(ctx.alice.clone());
 
-        ctx.payroll_client
-            .batch_process_payroll(&proofs, &amounts, &employees, &payment_amount);
+        ctx.payroll_client.batch_process_payroll(
+            &proofs,
+            &amounts,
+            &employees,
+            &payment_amount,
+            &test_nonce(env, 6),
+            &None,
+        );
 
         assert_eq!(
             ctx.token_client.balance(&ctx.treasury),
@@ -429,5 +653,179 @@ mod e2e {
 
         let expected_nullifier = BytesN::from_array(env, &[0u8; 32]);
         assert!(ctx.commitment_client.is_nullifier_used(&expected_nullifier));
+    }
+
+    /// End-to-end metadata hash verification (issue #177).
+    ///
+    /// Full flow: commit metadata hash → execute batch → bind metadata to run
+    /// → verify on-chain hash matches the committed value → verify mismatch
+    /// detection.
+    #[test]
+    fn test_e2e_metadata_hash_verification() {
+        let ctx = setup();
+        let env = &ctx.env;
+
+        // ── PHASE 1: Setup employee and treasury ─────────────────────────────
+        let commitment = alice_salary_commitment(&ctx.commitment_client);
+        ctx.commitment_client
+            .store_commitment(&ctx.alice, &commitment);
+        ctx.registry_client
+            .add_employee(&ctx.company_id, &ctx.alice, &commitment);
+
+        let initial_treasury: i128 = 10_000;
+        ctx.token_client.mint(&ctx.treasury, &initial_treasury);
+
+        // ── PHASE 2: Execute payroll ─────────────────────────────────────────
+        let payment_amount: i128 = 5_000;
+        let proof = mock_proof(env);
+
+        let mut proofs = Vec::new(env);
+        proofs.push_back(proof);
+        let mut amounts = Vec::new(env);
+        amounts.push_back(payment_amount);
+        let mut employees = Vec::new(env);
+        employees.push_back(ctx.alice.clone());
+
+        let run_id = ctx.payroll_client.batch_process_payroll(
+            &proofs,
+            &amounts,
+            &employees,
+            &payment_amount,
+            &test_nonce(env, 7),
+            &None,
+        );
+        assert!(run_id > 0);
+
+        // ── PHASE 3: Metadata hash defaults to zero ──────────────────────────
+        let zero_hash = BytesN::from_array(env, &[0u8; 32]);
+        let stored_hash = ctx.payroll_client.get_metadata_hash(&run_id);
+        assert_eq!(stored_hash, zero_hash);
+        assert!(ctx.payroll_client.verify_metadata_hash(&run_id, &zero_hash));
+
+        // ── PHASE 4: Commit and bind metadata hash ───────────────────────────
+        let meta_hash = BytesN::from_array(env, &[0xAB; 32]);
+        ctx.payroll_client
+            .commit_metadata_hash(&ctx.admin, &meta_hash);
+        ctx.payroll_client
+            .set_run_metadata(&ctx.admin, &run_id, &meta_hash);
+
+        // ── PHASE 5: Verify on-chain hash matches committed value ────────────
+        let retrieved = ctx.payroll_client.get_metadata_hash(&run_id);
+        assert_eq!(retrieved, meta_hash);
+        assert!(ctx.payroll_client.verify_metadata_hash(&run_id, &meta_hash));
+
+        // ── PHASE 6: Verify mismatch detection ───────────────────────────────
+        let wrong_hash = BytesN::from_array(env, &[0xCD; 32]);
+        assert!(!ctx
+            .payroll_client
+            .verify_metadata_hash(&run_id, &wrong_hash));
+    }
+
+    /// Issue #201: Verify end-to-end failed payroll execution rollback across all contracts.
+    /// Ensures partial state is not retained in SalaryCommitment, Registry, Token, or Payroll.
+    #[test]
+    fn test_e2e_failed_payroll_execution_rollback() {
+        let ctx = setup();
+        let env = &ctx.env;
+
+        // Onboard Alice
+        let alice_commitment = alice_salary_commitment(&ctx.commitment_client);
+        ctx.commitment_client
+            .store_commitment(&ctx.alice, &alice_commitment);
+        ctx.registry_client
+            .add_employee(&ctx.company_id, &ctx.alice, &alice_commitment);
+
+        // Mint treasury tokens
+        let initial_treasury: i128 = 10_000;
+        ctx.token_client.mint(&ctx.treasury, &initial_treasury);
+
+        // Create an un-onboarded employee Bob
+        let bob = Address::generate(env);
+
+        // Build a batch targeting [Alice, Bob]
+        let mut proofs = Vec::new(env);
+        proofs.push_back(mock_proof(env));
+        proofs.push_back(mock_proof(env));
+
+        let mut amounts = Vec::new(env);
+        amounts.push_back(5_000i128);
+        amounts.push_back(5_000i128);
+
+        let mut employees = Vec::new(env);
+        employees.push_back(ctx.alice.clone());
+        employees.push_back(bob.clone());
+
+        let nonce = test_nonce(env, 201);
+
+        // Execution fails because Bob has no commitment stored
+        let res = ctx.payroll_client.try_batch_process_payroll(
+            &proofs,
+            &amounts,
+            &employees,
+            &10_000i128,
+            &nonce,
+            &None,
+        );
+        assert!(
+            res.is_err(),
+            "Batch processing must fail when Bob is missing commitment"
+        );
+
+        // 1. Treasury balance remains completely unchanged
+        assert_eq!(
+            ctx.token_client.balance(&ctx.treasury),
+            initial_treasury,
+            "Treasury balance must be unchanged after failed run"
+        );
+
+        // 2. Alice balance is still 0
+        assert_eq!(
+            ctx.token_client.balance(&ctx.alice),
+            0,
+            "Alice balance must be 0 after failed run"
+        );
+
+        // 3. Alice's nullifier was not recorded as used
+        let alice_nullifier = BytesN::from_array(env, &[0u8; 32]);
+        assert!(
+            !ctx.commitment_client.is_nullifier_used(&alice_nullifier),
+            "Alice's nullifier must not be used after failed run"
+        );
+
+        // 4. Alice's commitment updates were not locked
+        assert!(
+            !ctx.commitment_client.is_commitment_locked(&ctx.alice),
+            "Alice's commitment updates must not be locked after failed run"
+        );
+
+        // 5. Retrying with a valid batch for Alice succeeds completely
+        let mut valid_proofs = Vec::new(env);
+        valid_proofs.push_back(mock_proof(env));
+        let mut valid_amounts = Vec::new(env);
+        valid_amounts.push_back(5_000i128);
+        let mut valid_employees = Vec::new(env);
+        valid_employees.push_back(ctx.alice.clone());
+
+        let run_id = ctx.payroll_client.batch_process_payroll(
+            &valid_proofs,
+            &valid_amounts,
+            &valid_employees,
+            &5_000i128,
+            &nonce,
+            &None,
+        );
+        assert!(
+            run_id > 0,
+            "Valid payroll run must succeed after previous failure rollback"
+        );
+
+        // Verify post-retry success states
+        assert_eq!(ctx.token_client.balance(&ctx.alice), 5_000i128);
+        assert_eq!(
+            ctx.token_client.balance(&ctx.treasury),
+            initial_treasury - 5_000i128
+        );
+        assert!(ctx.commitment_client.is_nullifier_used(&alice_nullifier));
+        assert!(ctx.commitment_client.is_commitment_locked(&ctx.alice));
     }
 }

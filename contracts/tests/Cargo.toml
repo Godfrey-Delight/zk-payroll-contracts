@@ -1,0 +1,29 @@
+[package]
+name = "contract_tests"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[dev-dependencies]
+soroban-sdk = { workspace = true, features = ["testutils"] }
+payroll = { path = "../payroll" }
+proof_verifier = { path = "../proof_verifier" }
+salary_commitment = { path = "../salary_commitment" }
+token = { path = "../token" }
+
+[[test]]
+name = "liability_invariants"
+path = "liability_invariants.rs"
+
+[[test]]
+name = "onboarding_duplicate_reference"
+path = "onboarding_duplicate_reference.rs"
+
+[[test]]
+name = "draft_updated_timestamp"
+path = "draft_updated_timestamp.rs"
+
+[[test]]
+name = "draft_lock_owner"
+path = "draft_lock_owner.rs"

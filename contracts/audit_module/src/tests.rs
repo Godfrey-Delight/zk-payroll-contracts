@@ -1,6 +1,15 @@
 use super::*;
 use soroban_sdk::testutils::{Address as _, Events, Ledger as _};
-use soroban_sdk::{Env, Symbol};
+use soroban_sdk::{Env, IntoVal, Symbol};
+
+// soroban-sdk 27.x changed `Events::all()` to return a `ContractEvents`
+// struct instead of an indexable/iterable `Vec`. `.events()` still exposes
+// the raw XDR events as a plain slice, which is enough for count checks;
+// `ContractEvents` also keeps backward-compatible `PartialEq` against a full
+// `Vec<(Address, Vec<Val>, Val)>`, which content-checking tests below use.
+fn event_count(env: &Env) -> u32 {
+    env.events().all().events().len() as u32
+}
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -17,8 +26,6 @@ fn setup() -> (Env, soroban_sdk::Address) {
 // generate_view_key / verify_access
 // ---------------------------------------------------------------------------
 
-/// A generated key is stored in Persistent storage and verify_access returns
-/// true for that auditor while the ledger sequence ≤ expiration_ledger.
 #[test]
 fn test_generate_view_key_stores_and_verify_access_succeeds() {
     let (env, contract_id) = setup();
@@ -26,25 +33,36 @@ fn test_generate_view_key_stores_and_verify_access_succeeds() {
 
     let auditor = soroban_sdk::Address::generate(&env);
     let current_seq = env.ledger().sequence();
-    let expiration = current_seq + 1_000; // valid for 1 000 ledgers
+    let expiration = current_seq + 1_000;
 
     let key_bytes = client.generate_view_key(&auditor, &expiration);
 
-    // Key material must be 32 bytes and non-zero
     assert_eq!(key_bytes.len(), 32);
+
+    assert_eq!(
+        env.events().all(),
+        soroban_sdk::vec![
+            &env,
+            (
+                contract_id.clone(),
+                soroban_sdk::vec![
+                    &env,
+                    Symbol::new(&env, "ViewKeyGenerated").into_val(&env),
+                    auditor.clone().into_val(&env),
+                ],
+                (expiration,).into_val(&env),
+            ),
+        ]
+    );
 
     // verify_access: auditor holds a valid key
     assert!(client.verify_access(&auditor));
 
-    // Fetching the record returns the same key bytes and expiration
     let record = client.get_view_key(&auditor);
     assert_eq!(record.key_bytes, key_bytes);
     assert_eq!(record.expiration_ledger, expiration);
 }
 
-/// Two successive generate_view_key calls for the same auditor produce
-/// different key bytes (because the ledger sequence is included in the hash
-/// preimage), and the second call overwrites the first in Persistent storage.
 #[test]
 fn test_successive_generate_produces_unique_keys() {
     let (env, contract_id) = setup();
@@ -55,14 +73,12 @@ fn test_successive_generate_produces_unique_keys() {
 
     let key_a = client.generate_view_key(&auditor, &(seq + 500));
 
-    // Advance the ledger so the sequence nonce changes.
     env.ledger().set_sequence_number(seq + 1);
 
     let key_b = client.generate_view_key(&auditor, &(seq + 500));
 
     assert_ne!(key_a, key_b, "successive keys must be distinct");
 
-    // Only the most recent key must be live.
     let live = client.get_view_key(&auditor);
     assert_eq!(live.key_bytes, key_b);
 }
@@ -71,7 +87,6 @@ fn test_successive_generate_produces_unique_keys() {
 // Expiry (ledger sequence)
 // ---------------------------------------------------------------------------
 
-/// verify_access returns false when env.ledger().sequence() > expiration_ledger.
 #[test]
 fn test_verify_access_expired_fails() {
     let (env, contract_id) = setup();
@@ -83,16 +98,13 @@ fn test_verify_access_expired_fails() {
 
     client.generate_view_key(&auditor, &expiration);
 
-    // Key is still valid at expiration_ledger itself.
     env.ledger().set_sequence_number(expiration);
     assert!(client.verify_access(&auditor));
 
-    // One ledger past expiration – key becomes invalid.
     env.ledger().set_sequence_number(expiration + 1);
     assert!(!client.verify_access(&auditor));
 }
 
-/// An auditor that was never issued a key must get false from verify_access.
 #[test]
 fn test_verify_access_no_key_returns_false() {
     let (env, contract_id) = setup();
@@ -106,7 +118,6 @@ fn test_verify_access_no_key_returns_false() {
 // Revocation
 // ---------------------------------------------------------------------------
 
-/// The original admin can revoke a key; after that verify_access returns false.
 #[test]
 fn test_revoke_removes_key() {
     let (env, contract_id) = setup();
@@ -118,17 +129,34 @@ fn test_revoke_removes_key() {
 
     assert!(client.verify_access(&auditor));
 
-    // The contract address is used as `granted_by` in generate_view_key.
     let admin = contract_id.clone();
     client.revoke_view_key(&admin, &auditor);
 
+    // `env.events().all()` scopes to the *last* invocation only (soroban-sdk
+    // 27.x), so only `revoke_view_key`'s own event is present here — the
+    // earlier `ViewKeyGenerated` event from `generate_view_key` is not.
+    assert_eq!(
+        env.events().all(),
+        soroban_sdk::vec![
+            &env,
+            (
+                contract_id.clone(),
+                soroban_sdk::vec![
+                    &env,
+                    Symbol::new(&env, "AuditAccessRevoked").into_val(&env),
+                    admin.clone().into_val(&env),
+                    auditor.clone().into_val(&env),
+                ],
+                ().into_val(&env),
+            ),
+        ]
+    );
+
     assert!(!client.verify_access(&auditor));
 
-    // get_view_key must now return KeyNotFound.
     assert!(client.try_get_view_key(&auditor).is_err());
 }
 
-/// A different address attempting to revoke must receive NotKeyGranter.
 #[test]
 fn test_revoke_wrong_admin_fails() {
     let (env, contract_id) = setup();
@@ -146,8 +174,6 @@ fn test_revoke_wrong_admin_fails() {
 // Commitment verification
 // ---------------------------------------------------------------------------
 
-/// verify_commitment_with_key returns true for matching amount + blinding and
-/// false for a wrong amount.
 #[test]
 fn test_verify_commitment_with_key_matches() {
     let (env, contract_id) = setup();
@@ -160,7 +186,6 @@ fn test_verify_commitment_with_key_matches() {
     let amount: i128 = 500_000;
     let blinding = BytesN::from_array(&env, &[0xAB; 32]);
 
-    // Build stored_commitment the same way the contract does.
     let mut preimage = soroban_sdk::Bytes::new(&env);
     preimage.extend_from_array(&amount.to_le_bytes());
     let blinding_slice: [u8; 32] = (&blinding).into();
@@ -175,14 +200,15 @@ fn test_verify_commitment_with_key_matches() {
         &AuditScope::EmployeeList
     ));
 
-    // Wrong amount must not match.
-    assert!(!client.verify_commitment_with_key(
+    // Wrong amount must return CommitmentMismatch error
+    let result = client.try_verify_commitment_with_key(
         &auditor,
         &stored,
         &999_i128,
         &blinding,
-        &AuditScope::EmployeeList
-    ));
+        &AuditScope::EmployeeList,
+    );
+    assert!(result.is_err());
 }
 
 #[test]
@@ -274,7 +300,6 @@ fn test_cross_auditor_key_contamination_is_rejected() {
         .is_err());
 }
 
-/// AggregateOnly scope must be rejected by verify_commitment_with_key.
 #[test]
 fn test_aggregate_only_scope_rejects_commitment_verification() {
     let (env, contract_id) = setup();
@@ -313,7 +338,6 @@ fn test_successful_commitment_audit_emits_event() {
     preimage.extend_from_array(&blinding_slice);
     let stored: BytesN<32> = env.crypto().sha256(&preimage).into();
 
-    let before = env.events().all().len();
     assert!(client.verify_commitment_with_key(
         &auditor,
         &stored,
@@ -321,16 +345,15 @@ fn test_successful_commitment_audit_emits_event() {
         &blinding,
         &AuditScope::EmployeeList
     ));
-    let after = env.events().all().len();
-    assert_eq!(after, before + 1);
+    // `env.events().all()` scopes to the *last* invocation only (soroban-sdk
+    // 27.x), so this call's own event is exactly what should be present.
+    assert_eq!(event_count(&env), 1);
 }
 
 // ---------------------------------------------------------------------------
 // Aggregate report
 // ---------------------------------------------------------------------------
 
-/// generate_aggregate_report succeeds for a valid key and returns a report
-/// with the correct company_id and period.
 #[test]
 fn test_generate_aggregate_report_valid_key() {
     let (env, contract_id) = setup();
@@ -342,17 +365,1123 @@ fn test_generate_aggregate_report_valid_key() {
 
     let company_id = Symbol::new(&env, "ACME");
     let now = env.ledger().timestamp();
-    let before = env.events().all().len();
     let report = client.generate_aggregate_report(&auditor, &company_id, &now, &(now + 86_400));
-    let after = env.events().all().len();
 
     assert_eq!(report.company_id, company_id);
     assert_eq!(report.period_start, now);
-    assert_eq!(after, before + 1);
+    // `env.events().all()` scopes to the *last* invocation only (soroban-sdk
+    // 27.x), so this call's own event is exactly what should be present.
+    assert_eq!(event_count(&env), 1);
 
-    // An unknown auditor must fail.
     let stranger = soroban_sdk::Address::generate(&env);
     assert!(client
         .try_generate_aggregate_report(&stranger, &company_id, &now, &(now + 86_400))
         .is_err());
+}
+
+// ---------------------------------------------------------------------------
+// Audit query patterns — company-level, employee-level, period-level
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_query_by_company_returns_audit_log_entries() {
+    let (env, contract_id) = setup();
+    let client = AuditModuleClient::new(&env, &contract_id);
+
+    let auditor = soroban_sdk::Address::generate(&env);
+    let seq = env.ledger().sequence();
+    client.generate_view_key(&auditor, &(seq + 1_000));
+
+    let amount: i128 = 100_000;
+    let blinding = BytesN::from_array(&env, &[0xBB; 32]);
+    let mut preimage = soroban_sdk::Bytes::new(&env);
+    preimage.extend_from_array(&amount.to_le_bytes());
+    let blinding_slice: [u8; 32] = (&blinding).into();
+    preimage.extend_from_array(&blinding_slice);
+    let stored: BytesN<32> = env.crypto().sha256(&preimage).into();
+
+    client.verify_commitment_with_key(
+        &auditor,
+        &stored,
+        &amount,
+        &blinding,
+        &AuditScope::EmployeeList,
+    );
+
+    let company_id = Symbol::new(&env, "default");
+    let result = client.query_by_company(&company_id);
+
+    assert!(!result.entries.is_empty());
+}
+
+#[test]
+fn test_query_by_employee_filters_by_auditor() {
+    let (env, contract_id) = setup();
+    let client = AuditModuleClient::new(&env, &contract_id);
+
+    let auditor = soroban_sdk::Address::generate(&env);
+    let seq = env.ledger().sequence();
+    client.generate_view_key(&auditor, &(seq + 1_000));
+
+    let amount: i128 = 50_000;
+    let blinding = BytesN::from_array(&env, &[0xCC; 32]);
+    let mut preimage = soroban_sdk::Bytes::new(&env);
+    preimage.extend_from_array(&amount.to_le_bytes());
+    let blinding_slice: [u8; 32] = (&blinding).into();
+    preimage.extend_from_array(&blinding_slice);
+    let stored: BytesN<32> = env.crypto().sha256(&preimage).into();
+
+    client.verify_commitment_with_key(
+        &auditor,
+        &stored,
+        &amount,
+        &blinding,
+        &AuditScope::EmployeeList,
+    );
+
+    let company_id = Symbol::new(&env, "default");
+    let result = client.query_by_employee(&company_id, &auditor);
+
+    assert!(!result.entries.is_empty());
+}
+
+#[test]
+fn test_query_by_period_filters_by_time_range() {
+    let (env, contract_id) = setup();
+    let client = AuditModuleClient::new(&env, &contract_id);
+
+    let auditor = soroban_sdk::Address::generate(&env);
+    let seq = env.ledger().sequence();
+    client.generate_view_key(&auditor, &(seq + 1_000));
+
+    let amount: i128 = 75_000;
+    let blinding = BytesN::from_array(&env, &[0xDD; 32]);
+    let mut preimage = soroban_sdk::Bytes::new(&env);
+    preimage.extend_from_array(&amount.to_le_bytes());
+    let blinding_slice: [u8; 32] = (&blinding).into();
+    preimage.extend_from_array(&blinding_slice);
+    let stored: BytesN<32> = env.crypto().sha256(&preimage).into();
+
+    let ts = env.ledger().timestamp();
+    client.verify_commitment_with_key(
+        &auditor,
+        &stored,
+        &amount,
+        &blinding,
+        &AuditScope::EmployeeList,
+    );
+
+    let company_id = Symbol::new(&env, "default");
+    let result = client.query_by_period(&company_id, &ts, &(ts + 10_000));
+
+    assert!(!result.entries.is_empty());
+}
+
+#[test]
+fn test_get_audit_log_count_increments() {
+    let (env, contract_id) = setup();
+    let client = AuditModuleClient::new(&env, &contract_id);
+
+    let auditor = soroban_sdk::Address::generate(&env);
+    let seq = env.ledger().sequence();
+    client.generate_view_key(&auditor, &(seq + 1_000));
+
+    let company_id = Symbol::new(&env, "default");
+    let count_before = client.get_audit_log_count(&company_id);
+
+    let amount: i128 = 25_000;
+    let blinding = BytesN::from_array(&env, &[0xEE; 32]);
+    let mut preimage = soroban_sdk::Bytes::new(&env);
+    preimage.extend_from_array(&amount.to_le_bytes());
+    let blinding_slice: [u8; 32] = (&blinding).into();
+    preimage.extend_from_array(&blinding_slice);
+    let stored: BytesN<32> = env.crypto().sha256(&preimage).into();
+
+    client.verify_commitment_with_key(
+        &auditor,
+        &stored,
+        &amount,
+        &blinding,
+        &AuditScope::EmployeeList,
+    );
+
+    let count_after = client.get_audit_log_count(&company_id);
+    assert!(count_after > count_before);
+}
+
+// ── Issue #93: audit metadata export ─────────────────────────────────────────
+
+#[test]
+fn test_export_audit_summary_returns_correct_counts() {
+    let (env, contract_id) = setup();
+    let client = AuditModuleClient::new(&env, &contract_id);
+
+    let auditor = soroban_sdk::Address::generate(&env);
+    let seq = env.ledger().sequence();
+    client.generate_view_key(&auditor, &(seq + 1_000));
+
+    // Generate one passing and one failing audit entry.
+    let amount: i128 = 10_000;
+    let blinding = BytesN::from_array(&env, &[0xAA; 32]);
+    let mut preimage = soroban_sdk::Bytes::new(&env);
+    preimage.extend_from_array(&amount.to_le_bytes());
+    let blinding_slice: [u8; 32] = (&blinding).into();
+    preimage.extend_from_array(&blinding_slice);
+    let correct_commitment: BytesN<32> = env.crypto().sha256(&preimage).into();
+
+    // Pass 1: commitment verification
+    client.verify_commitment_with_key(
+        &auditor,
+        &correct_commitment,
+        &amount,
+        &blinding,
+        &AuditScope::FullCompany,
+    );
+
+    let company_id = Symbol::new(&env, "default");
+    let ts = env.ledger().timestamp();
+
+    // Pass 2: aggregate report generation
+    let _ = client.generate_aggregate_report(&auditor, &company_id, &0u64, &(ts + 1_000));
+
+    let summary = client.export_audit_summary(&auditor, &company_id, &0u64, &(ts + 1_000_000u64));
+
+    assert_eq!(summary.company_id, company_id);
+    assert_eq!(summary.exported_by, auditor);
+    assert!(summary.total_audit_entries >= 2);
+    assert!(summary.verification_pass_count >= 1);
+}
+
+#[test]
+fn test_export_audit_summary_excludes_out_of_period_entries() {
+    let (env, contract_id) = setup();
+    let client = AuditModuleClient::new(&env, &contract_id);
+
+    let auditor = soroban_sdk::Address::generate(&env);
+    let seq = env.ledger().sequence();
+    client.generate_view_key(&auditor, &(seq + 1_000));
+
+    let amount: i128 = 5_000;
+    let blinding = BytesN::from_array(&env, &[0xBB; 32]);
+    let mut preimage = soroban_sdk::Bytes::new(&env);
+    preimage.extend_from_array(&amount.to_le_bytes());
+    let blinding_slice: [u8; 32] = (&blinding).into();
+    preimage.extend_from_array(&blinding_slice);
+    let commitment: BytesN<32> = env.crypto().sha256(&preimage).into();
+
+    client.verify_commitment_with_key(
+        &auditor,
+        &commitment,
+        &amount,
+        &blinding,
+        &AuditScope::FullCompany,
+    );
+
+    let company_id = Symbol::new(&env, "default");
+    // Request a period that is far in the future — no entries should match.
+    let far_future: u64 = 999_999_999_999;
+    let summary =
+        client.export_audit_summary(&auditor, &company_id, &far_future, &(far_future + 1_000));
+
+    assert_eq!(summary.total_audit_entries, 0);
+    assert_eq!(summary.verification_pass_count, 0);
+    assert_eq!(summary.verification_fail_count, 0);
+}
+
+#[test]
+fn test_export_audit_summary_requires_valid_key() {
+    let (env, contract_id) = setup();
+    let client = AuditModuleClient::new(&env, &contract_id);
+
+    let stranger = soroban_sdk::Address::generate(&env);
+    let company_id = Symbol::new(&env, "default");
+
+    // Stranger has no view key — should return KeyNotFound error.
+    assert!(client
+        .try_export_audit_summary(&stranger, &company_id, &0u64, &1_000u64)
+        .is_err());
+}
+
+#[test]
+fn test_export_audit_summary_emits_event() {
+    let (env, contract_id) = setup();
+    let client = AuditModuleClient::new(&env, &contract_id);
+
+    let auditor = soroban_sdk::Address::generate(&env);
+    let seq = env.ledger().sequence();
+    client.generate_view_key(&auditor, &(seq + 1_000));
+
+    let company_id = Symbol::new(&env, "default");
+    let ts = env.ledger().timestamp();
+    client.export_audit_summary(&auditor, &company_id, &0u64, &(ts + 1_000));
+
+    // `env.events().all()` scopes to the *last* invocation only (soroban-sdk
+    // 27.x), so this call's own event is exactly what should be present.
+    assert_eq!(event_count(&env), 1);
+}
+
+// ── Issue #607: audit export integrity marker ────────────────────────────────
+
+#[test]
+fn test_export_audit_summary_carries_verifiable_integrity_marker() {
+    let (env, contract_id) = setup();
+    let client = AuditModuleClient::new(&env, &contract_id);
+
+    let auditor = soroban_sdk::Address::generate(&env);
+    let seq = env.ledger().sequence();
+    client.generate_view_key(&auditor, &(seq + 1_000));
+
+    let company_id = Symbol::new(&env, "default");
+    let now = env.ledger().timestamp();
+    let summary = client.export_audit_summary(&auditor, &company_id, &0u64, &(now + 1_000));
+
+    assert_ne!(
+        summary.integrity_marker,
+        BytesN::from_array(&env, &[0u8; 32]),
+        "export must carry a non-zero integrity marker"
+    );
+    assert!(
+        client.verify_audit_export_integrity(&summary),
+        "a freshly exported summary must verify"
+    );
+}
+
+#[test]
+fn test_audit_export_integrity_detects_tampered_count() {
+    let (env, contract_id) = setup();
+    let client = AuditModuleClient::new(&env, &contract_id);
+
+    let auditor = soroban_sdk::Address::generate(&env);
+    let seq = env.ledger().sequence();
+    client.generate_view_key(&auditor, &(seq + 1_000));
+
+    let company_id = Symbol::new(&env, "default");
+    let now = env.ledger().timestamp();
+    let summary = client.export_audit_summary(&auditor, &company_id, &0u64, &(now + 1_000));
+
+    // Forge a more favourable export by inflating the pass count without
+    // recomputing the marker — verification must reject it.
+    let mut tampered = summary.clone();
+    tampered.verification_pass_count += 1;
+
+    assert!(
+        !client.verify_audit_export_integrity(&tampered),
+        "a tampered count must not verify"
+    );
+    // The original export is unaffected.
+    assert!(client.verify_audit_export_integrity(&summary));
+}
+
+#[test]
+fn test_audit_export_integrity_detects_tampered_exporter() {
+    let (env, contract_id) = setup();
+    let client = AuditModuleClient::new(&env, &contract_id);
+
+    let auditor = soroban_sdk::Address::generate(&env);
+    let seq = env.ledger().sequence();
+    client.generate_view_key(&auditor, &(seq + 1_000));
+
+    let company_id = Symbol::new(&env, "default");
+    let now = env.ledger().timestamp();
+    let summary = client.export_audit_summary(&auditor, &company_id, &0u64, &(now + 1_000));
+
+    let mut tampered = summary.clone();
+    tampered.exported_by = soroban_sdk::Address::generate(&env);
+
+    assert!(
+        !client.verify_audit_export_integrity(&tampered),
+        "changing the exporter must invalidate the marker"
+    );
+}
+
+#[test]
+fn test_audit_export_integrity_rejects_missing_marker() {
+    let (env, contract_id) = setup();
+    let client = AuditModuleClient::new(&env, &contract_id);
+
+    let auditor = soroban_sdk::Address::generate(&env);
+    let company_id = Symbol::new(&env, "default");
+    let summary = AuditMetadataSummary {
+        company_id: company_id.clone(),
+        period_start: 0,
+        period_end: 1_000,
+        total_audit_entries: 0,
+        verification_pass_count: 0,
+        verification_fail_count: 0,
+        exported_at: 0,
+        exported_by: auditor,
+        integrity_marker: BytesN::from_array(&env, &[0u8; 32]),
+    };
+
+    let result = client.try_verify_audit_export_integrity(&summary);
+    assert_eq!(
+        result.unwrap_err().unwrap(),
+        AuditError::IntegrityMarkerMissing
+    );
+}
+
+#[test]
+fn test_audit_export_integrity_marker_is_deterministic() {
+    let (env, contract_id) = setup();
+    let client = AuditModuleClient::new(&env, &contract_id);
+
+    let auditor = soroban_sdk::Address::generate(&env);
+    let seq = env.ledger().sequence();
+    client.generate_view_key(&auditor, &(seq + 1_000));
+
+    let company_id = Symbol::new(&env, "default");
+    let now = env.ledger().timestamp();
+
+    // Exporting the same unchanged on-chain state twice yields the same marker.
+    let first = client.export_audit_summary(&auditor, &company_id, &0u64, &(now + 1_000));
+    let second = client.export_audit_summary(&auditor, &company_id, &0u64, &(now + 1_000));
+
+    assert_eq!(first.integrity_marker, second.integrity_marker);
+}
+
+// ── Issue #172: revoked audit grants cannot read/export/validate audit data ──
+//
+// These tests confirm that once `revoke_view_key` succeeds, every
+// authorize_auditor-gated entry point rejects the former auditor with
+// `AuditError::KeyNotFound` — the same failure mode as an auditor who was
+// never granted a key. This is the property compliance relies on: revocation
+// must immediately and completely cut off access to restricted audit data,
+// with no operation left that still honors the stale grant.
+
+fn make_commitment(env: &Env, amount: i128, blinding: &BytesN<32>) -> BytesN<32> {
+    let mut preimage = soroban_sdk::Bytes::new(env);
+    preimage.extend_from_array(&amount.to_le_bytes());
+    let blinding_slice: [u8; 32] = blinding.into();
+    preimage.extend_from_array(&blinding_slice);
+    env.crypto().sha256(&preimage).into()
+}
+
+#[test]
+fn test_revoked_key_cannot_validate_commitment_with_key() {
+    let (env, contract_id) = setup();
+    let client = AuditModuleClient::new(&env, &contract_id);
+
+    let auditor = soroban_sdk::Address::generate(&env);
+    let seq = env.ledger().sequence();
+    client.generate_view_key(&auditor, &(seq + 1_000));
+
+    let amount: i128 = 100_000;
+    let blinding = BytesN::from_array(&env, &[0x21; 32]);
+    let stored = make_commitment(&env, amount, &blinding);
+
+    // Sanity check: verification succeeds while the grant is live.
+    assert!(client.verify_commitment_with_key(
+        &auditor,
+        &stored,
+        &amount,
+        &blinding,
+        &AuditScope::EmployeeList
+    ));
+
+    let admin = contract_id.clone();
+    client.revoke_view_key(&admin, &auditor);
+
+    let result = client.try_verify_commitment_with_key(
+        &auditor,
+        &stored,
+        &amount,
+        &blinding,
+        &AuditScope::EmployeeList,
+    );
+    assert_eq!(result.unwrap_err().unwrap(), AuditError::KeyNotFound);
+}
+
+#[test]
+fn test_revoked_key_cannot_validate_commitment_with_supplied_view_key() {
+    let (env, contract_id) = setup();
+    let client = AuditModuleClient::new(&env, &contract_id);
+
+    let auditor = soroban_sdk::Address::generate(&env);
+    let seq = env.ledger().sequence();
+    let key = client.generate_view_key(&auditor, &(seq + 1_000));
+
+    let amount: i128 = 120_000;
+    let blinding = BytesN::from_array(&env, &[0x22; 32]);
+    let stored = make_commitment(&env, amount, &blinding);
+
+    // Sanity check: verification succeeds while the grant is live.
+    assert!(client.verify_commitment_with_view_key(
+        &auditor,
+        &key,
+        &stored,
+        &amount,
+        &blinding,
+        &AuditScope::EmployeeList
+    ));
+
+    let admin = contract_id.clone();
+    client.revoke_view_key(&admin, &auditor);
+
+    // Even presenting the still-known key bytes must fail, since the
+    // underlying grant record no longer exists.
+    let result = client.try_verify_commitment_with_view_key(
+        &auditor,
+        &key,
+        &stored,
+        &amount,
+        &blinding,
+        &AuditScope::EmployeeList,
+    );
+    assert_eq!(result.unwrap_err().unwrap(), AuditError::KeyNotFound);
+}
+
+#[test]
+fn test_revoked_key_cannot_generate_aggregate_report() {
+    let (env, contract_id) = setup();
+    let client = AuditModuleClient::new(&env, &contract_id);
+
+    let auditor = soroban_sdk::Address::generate(&env);
+    let seq = env.ledger().sequence();
+    client.generate_view_key(&auditor, &(seq + 1_000));
+
+    let company_id = Symbol::new(&env, "ACME");
+    let now = env.ledger().timestamp();
+
+    // Sanity check: report generation succeeds while the grant is live.
+    assert!(client
+        .try_generate_aggregate_report(&auditor, &company_id, &now, &(now + 86_400))
+        .is_ok());
+
+    let admin = contract_id.clone();
+    client.revoke_view_key(&admin, &auditor);
+
+    let result = client.try_generate_aggregate_report(&auditor, &company_id, &now, &(now + 86_400));
+    assert_eq!(result.unwrap_err().unwrap(), AuditError::KeyNotFound);
+}
+
+#[test]
+fn test_revoked_key_cannot_export_audit_summary() {
+    let (env, contract_id) = setup();
+    let client = AuditModuleClient::new(&env, &contract_id);
+
+    let auditor = soroban_sdk::Address::generate(&env);
+    let seq = env.ledger().sequence();
+    client.generate_view_key(&auditor, &(seq + 1_000));
+
+    let company_id = Symbol::new(&env, "default");
+    let ts = env.ledger().timestamp();
+
+    // Sanity check: export succeeds while the grant is live.
+    assert!(client
+        .try_export_audit_summary(&auditor, &company_id, &0u64, &(ts + 1_000))
+        .is_ok());
+
+    let admin = contract_id.clone();
+    client.revoke_view_key(&admin, &auditor);
+
+    let result = client.try_export_audit_summary(&auditor, &company_id, &0u64, &(ts + 1_000));
+    assert_eq!(result.unwrap_err().unwrap(), AuditError::KeyNotFound);
+}
+
+#[test]
+fn test_revoked_key_cannot_read_view_key_record() {
+    let (env, contract_id) = setup();
+    let client = AuditModuleClient::new(&env, &contract_id);
+
+    let auditor = soroban_sdk::Address::generate(&env);
+    let seq = env.ledger().sequence();
+    client.generate_view_key(&auditor, &(seq + 1_000));
+
+    let admin = contract_id.clone();
+    client.revoke_view_key(&admin, &auditor);
+
+    let result = client.try_get_view_key(&auditor);
+    assert_eq!(result.unwrap_err().unwrap(), AuditError::KeyNotFound);
+}
+
+#[test]
+fn test_revocation_does_not_affect_other_auditors() {
+    let (env, contract_id) = setup();
+    let client = AuditModuleClient::new(&env, &contract_id);
+
+    let revoked_auditor = soroban_sdk::Address::generate(&env);
+    let active_auditor = soroban_sdk::Address::generate(&env);
+    let seq = env.ledger().sequence();
+    client.generate_view_key(&revoked_auditor, &(seq + 1_000));
+    client.generate_view_key(&active_auditor, &(seq + 1_000));
+
+    let admin = contract_id.clone();
+    client.revoke_view_key(&admin, &revoked_auditor);
+
+    // The revoked auditor loses access...
+    assert!(!client.verify_access(&revoked_auditor));
+    assert!(client.try_get_view_key(&revoked_auditor).is_err());
+
+    // ...but an unrelated auditor's grant must remain fully intact.
+    assert!(client.verify_access(&active_auditor));
+
+    let company_id = Symbol::new(&env, "ACME");
+    let now = env.ledger().timestamp();
+    assert!(client
+        .try_generate_aggregate_report(&active_auditor, &company_id, &now, &(now + 86_400))
+        .is_ok());
+}
+
+#[test]
+fn test_revoke_then_regrant_restores_access() {
+    let (env, contract_id) = setup();
+    let client = AuditModuleClient::new(&env, &contract_id);
+
+    let auditor = soroban_sdk::Address::generate(&env);
+    let seq = env.ledger().sequence();
+    client.generate_view_key(&auditor, &(seq + 1_000));
+
+    let admin = contract_id.clone();
+    client.revoke_view_key(&admin, &auditor);
+    assert!(!client.verify_access(&auditor));
+
+    // Issuing a fresh grant after revocation must restore access — a stale
+    // revocation must not permanently lock the auditor out.
+    let new_key = client.generate_view_key(&auditor, &(seq + 2_000));
+    assert!(client.verify_access(&auditor));
+
+    let amount: i128 = 33_000;
+    let blinding = BytesN::from_array(&env, &[0x33; 32]);
+    let stored = make_commitment(&env, amount, &blinding);
+
+    assert!(client.verify_commitment_with_view_key(
+        &auditor,
+        &new_key,
+        &stored,
+        &amount,
+        &blinding,
+        &AuditScope::EmployeeList
+    ));
+}
+
+// ── Issue #171: admin / auditor role-boundary tests ──────────────────────────
+//
+// FINDING: `generate_view_key` takes no caller/admin parameter and never
+// calls `require_auth()` anywhere in its body — there is no admin role
+// gating who may grant auditor access in this contract at all. It also
+// always records `granted_by` as the contract's own address
+// (`env.current_contract_address()`), never the caller, which means
+// `revoke_view_key` can never be satisfied by any genuine external admin
+// either (see `revoke_view_key`'s `record.granted_by != admin` check).
+//
+// The two tests below document this as currently-observed behavior. They
+// are not an endorsement that it is correct — flagged separately for a
+// follow-up fix, out of scope for this tests-only issue.
+
+#[test]
+fn test_generate_view_key_has_no_caller_authorization() {
+    // Deliberately no mock_all_auths() and no mocked auths whatsoever — this
+    // call succeeds even for a completely unauthenticated invocation.
+    let env = Env::default();
+    let contract_id = env.register_contract(None, AuditModule);
+    let client = AuditModuleClient::new(&env, &contract_id);
+
+    let self_appointed_auditor = soroban_sdk::Address::generate(&env);
+    let seq = env.ledger().sequence();
+    client.generate_view_key(&self_appointed_auditor, &(seq + 1_000));
+
+    assert!(client.verify_access(&self_appointed_auditor));
+}
+
+#[test]
+fn test_revoke_view_key_rejects_genuine_external_admin() {
+    let (env, contract_id) = setup();
+    let client = AuditModuleClient::new(&env, &contract_id);
+
+    let auditor = soroban_sdk::Address::generate(&env);
+    let seq = env.ledger().sequence();
+    client.generate_view_key(&auditor, &(seq + 1_000));
+
+    // A real, externally-controlled address, signing legitimately —
+    // still not the contract's own address stored as `granted_by`.
+    let would_be_admin = soroban_sdk::Address::generate(&env);
+    let result = client.try_revoke_view_key(&would_be_admin, &auditor);
+    assert_eq!(result.unwrap_err().unwrap(), AuditError::NotKeyGranter);
+
+    // The grant remains fully intact — the revocation attempt had no effect.
+    assert!(client.verify_access(&auditor));
+}
+
+// ── Issue #177: metadata hash verification via audit scope ──────────────────
+
+#[test]
+fn test_verify_payroll_metadata_match_returns_true() {
+    let (env, contract_id) = setup();
+    let client = AuditModuleClient::new(&env, &contract_id);
+
+    let auditor = soroban_sdk::Address::generate(&env);
+    let seq = env.ledger().sequence();
+    client.generate_view_key(&auditor, &(seq + 1_000));
+
+    let hash = BytesN::from_array(&env, &[0xAA; 32]);
+    let result = client.verify_payroll_metadata(&auditor, &hash, &hash, &AuditScope::FullCompany);
+    assert!(result);
+}
+
+#[test]
+fn test_verify_payroll_metadata_mismatch_returns_false() {
+    let (env, contract_id) = setup();
+    let client = AuditModuleClient::new(&env, &contract_id);
+
+    let auditor = soroban_sdk::Address::generate(&env);
+    let seq = env.ledger().sequence();
+    client.generate_view_key(&auditor, &(seq + 1_000));
+
+    let stored = BytesN::from_array(&env, &[0xBB; 32]);
+    let expected = BytesN::from_array(&env, &[0xCC; 32]);
+    let result =
+        client.verify_payroll_metadata(&auditor, &stored, &expected, &AuditScope::FullCompany);
+    assert!(!result);
+}
+
+#[test]
+fn test_verify_payroll_metadata_records_audit_log() {
+    let (env, contract_id) = setup();
+    let client = AuditModuleClient::new(&env, &contract_id);
+
+    let auditor = soroban_sdk::Address::generate(&env);
+    let seq = env.ledger().sequence();
+    client.generate_view_key(&auditor, &(seq + 1_000));
+
+    let hash = BytesN::from_array(&env, &[0xDD; 32]);
+    let before = client.get_audit_log_count(&Symbol::new(&env, "default"));
+    let _ = client.verify_payroll_metadata(&auditor, &hash, &hash, &AuditScope::FullCompany);
+    let after = client.get_audit_log_count(&Symbol::new(&env, "default"));
+    assert!(after > before);
+}
+
+#[test]
+fn test_verify_payroll_metadata_emits_match_event() {
+    let (env, contract_id) = setup();
+    let client = AuditModuleClient::new(&env, &contract_id);
+
+    let auditor = soroban_sdk::Address::generate(&env);
+    let seq = env.ledger().sequence();
+    client.generate_view_key(&auditor, &(seq + 1_000));
+
+    let hash = BytesN::from_array(&env, &[0xEE; 32]);
+    let _ = client.verify_payroll_metadata(&auditor, &hash, &hash, &AuditScope::FullCompany);
+    // `env.events().all()` scopes to the *last* invocation only (soroban-sdk
+    // 27.x), so this call's own event is exactly what should be present.
+    assert_eq!(event_count(&env), 1);
+}
+
+#[test]
+fn test_verify_payroll_metadata_emits_mismatch_event() {
+    let (env, contract_id) = setup();
+    let client = AuditModuleClient::new(&env, &contract_id);
+
+    let auditor = soroban_sdk::Address::generate(&env);
+    let seq = env.ledger().sequence();
+    client.generate_view_key(&auditor, &(seq + 1_000));
+
+    let stored = BytesN::from_array(&env, &[0x11; 32]);
+    let expected = BytesN::from_array(&env, &[0x22; 32]);
+    let _ = client.verify_payroll_metadata(&auditor, &stored, &expected, &AuditScope::FullCompany);
+    // `env.events().all()` scopes to the *last* invocation only (soroban-sdk
+    // 27.x), so this call's own event is exactly what should be present.
+    assert_eq!(event_count(&env), 1);
+}
+
+#[test]
+fn test_verify_payroll_metadata_requires_valid_key() {
+    let (env, contract_id) = setup();
+    let client = AuditModuleClient::new(&env, &contract_id);
+
+    let stranger = soroban_sdk::Address::generate(&env);
+    let hash = BytesN::from_array(&env, &[0x33; 32]);
+    let result =
+        client.try_verify_payroll_metadata(&stranger, &hash, &hash, &AuditScope::FullCompany);
+    assert!(result.is_err());
+}
+
+#[test]
+fn test_verify_payroll_metadata_rejects_aggregate_only_scope() {
+    let (env, contract_id) = setup();
+    let client = AuditModuleClient::new(&env, &contract_id);
+
+    let auditor = soroban_sdk::Address::generate(&env);
+    let seq = env.ledger().sequence();
+    client.generate_view_key(&auditor, &(seq + 1_000));
+
+    let hash = BytesN::from_array(&env, &[0x44; 32]);
+    let result =
+        client.try_verify_payroll_metadata(&auditor, &hash, &hash, &AuditScope::AggregateOnly);
+    assert!(result.is_err());
+}
+
+#[test]
+fn test_verify_payroll_metadata_revoked_auditor_rejected() {
+    let (env, contract_id) = setup();
+    let client = AuditModuleClient::new(&env, &contract_id);
+
+    let auditor = soroban_sdk::Address::generate(&env);
+    let seq = env.ledger().sequence();
+    client.generate_view_key(&auditor, &(seq + 1_000));
+
+    let admin = contract_id.clone();
+    client.revoke_view_key(&admin, &auditor);
+
+    let hash = BytesN::from_array(&env, &[0x55; 32]);
+    let result =
+        client.try_verify_payroll_metadata(&auditor, &hash, &hash, &AuditScope::FullCompany);
+    assert_eq!(result.unwrap_err().unwrap(), AuditError::KeyNotFound);
+}
+
+#[test]
+fn test_delegation_is_rejected_by_default() {
+    let (env, contract_id) = setup();
+    let client = AuditModuleClient::new(&env, &contract_id);
+
+    let auditor = soroban_sdk::Address::generate(&env);
+    let delegate = soroban_sdk::Address::generate(&env);
+    let seq = env.ledger().sequence();
+    client.generate_view_key(&auditor, &(seq + 1_000));
+
+    let result =
+        client.try_delegate_view_key(&auditor, &delegate, &AuditScope::EmployeeList, &(seq + 500));
+    assert_eq!(
+        result.unwrap_err().unwrap(),
+        AuditError::DelegationNotAllowed
+    );
+}
+
+#[test]
+fn test_allowed_delegation_respects_parent_constraints() {
+    let (env, contract_id) = setup();
+    let client = AuditModuleClient::new(&env, &contract_id);
+
+    let auditor = soroban_sdk::Address::generate(&env);
+    let delegate = soroban_sdk::Address::generate(&env);
+    let seq = env.ledger().sequence();
+    let admin = contract_id.clone();
+    client.generate_view_key(&auditor, &(seq + 1_000));
+    client.set_delegation_policy(
+        &admin,
+        &auditor,
+        &true,
+        &AuditScope::FullCompany,
+        &(seq + 1_000),
+    );
+
+    let key =
+        client.delegate_view_key(&auditor, &delegate, &AuditScope::EmployeeList, &(seq + 500));
+    assert_eq!(key.len(), 32);
+
+    let bad = client.try_delegate_view_key(
+        &auditor,
+        &soroban_sdk::Address::generate(&env),
+        &AuditScope::FullCompany,
+        &(seq + 1_500),
+    );
+    assert_eq!(
+        bad.unwrap_err().unwrap(),
+        AuditError::DelegationExceedsParentExpiry
+    );
+}
+
+#[test]
+fn test_nested_delegation_and_parent_revocation_invalidate_descendants() {
+    let (env, contract_id) = setup();
+    let client = AuditModuleClient::new(&env, &contract_id);
+
+    let root = soroban_sdk::Address::generate(&env);
+    let child = soroban_sdk::Address::generate(&env);
+    let grandchild = soroban_sdk::Address::generate(&env);
+    let seq = env.ledger().sequence();
+    let admin = contract_id.clone();
+
+    client.generate_view_key(&root, &(seq + 2_000));
+    client.set_delegation_policy(
+        &admin,
+        &root,
+        &true,
+        &AuditScope::FullCompany,
+        &(seq + 2_000),
+    );
+
+    client.delegate_view_key(&root, &child, &AuditScope::EmployeeList, &(seq + 1_500));
+    client.set_delegation_policy(
+        &root,
+        &child,
+        &true,
+        &AuditScope::EmployeeList,
+        &(seq + 1_500),
+    );
+    client.delegate_view_key(
+        &child,
+        &grandchild,
+        &AuditScope::AggregateOnly,
+        &(seq + 1_000),
+    );
+
+    assert!(client.verify_access(&child));
+    assert!(client.verify_access(&grandchild));
+
+    client.revoke_view_key(&admin, &root);
+    assert!(!client.verify_access(&child));
+    assert!(!client.verify_access(&grandchild));
+}
+
+// ---------------------------------------------------------------------------
+// Issue #271: audit request expiration coverage
+//
+// `verify_access` (above) already pins the boundary for the lightweight
+// read-only check. The tests below cover the *other* expiry-gated surfaces
+// that back actual audit requests and previously had no boundary coverage
+// at all:
+//
+//   - `authorize_auditor` — the internal gate behind every operational audit
+//     request (`verify_commitment_with_key`, `verify_commitment_with_view_key`,
+//     `generate_aggregate_report`, `export_audit_summary`,
+//     `verify_payroll_metadata`). It also *attempts* to emit
+//     `AuditAccessExpired` on the failure path — see the finding documented
+//     on `test_authorize_auditor_after_expiry_commitment_verification_fails_and_rolls_back_event`
+//     below: that event is actually rolled back by Soroban's invocation
+//     atomicity guarantee and is never observable off-chain.
+//   - `prune_expired_view_key` — admin-driven cleanup with its own grace
+//     period boundary, previously untested altogether.
+//
+// Boundary convention (documented in docs/security/proof-reference-expiry.md,
+// which notes that `proof_verifier` mirrors this exact rule): a grant is
+// valid while `ledger.sequence() <= expiration_ledger` and expired starting
+// at `expiration_ledger + 1`.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_authorize_auditor_before_expiry_commitment_verification_succeeds() {
+    let (env, contract_id) = setup();
+    let client = AuditModuleClient::new(&env, &contract_id);
+
+    let auditor = soroban_sdk::Address::generate(&env);
+    let seq = env.ledger().sequence();
+    let expiration = seq + 100;
+    client.generate_view_key(&auditor, &expiration);
+
+    let amount: i128 = 42_000;
+    let blinding = BytesN::from_array(&env, &[0x11; 32]);
+    let stored = make_commitment(&env, amount, &blinding);
+
+    env.ledger().set_sequence_number(expiration - 1);
+
+    assert!(client.verify_commitment_with_key(
+        &auditor,
+        &stored,
+        &amount,
+        &blinding,
+        &AuditScope::EmployeeList
+    ));
+}
+
+#[test]
+fn test_authorize_auditor_at_expiry_boundary_commitment_verification_succeeds() {
+    let (env, contract_id) = setup();
+    let client = AuditModuleClient::new(&env, &contract_id);
+
+    let auditor = soroban_sdk::Address::generate(&env);
+    let seq = env.ledger().sequence();
+    let expiration = seq + 100;
+    client.generate_view_key(&auditor, &expiration);
+
+    let amount: i128 = 42_000;
+    let blinding = BytesN::from_array(&env, &[0x22; 32]);
+    let stored = make_commitment(&env, amount, &blinding);
+
+    // Exactly at the expiration ledger — still within the valid window.
+    env.ledger().set_sequence_number(expiration);
+
+    assert!(client.verify_commitment_with_key(
+        &auditor,
+        &stored,
+        &amount,
+        &blinding,
+        &AuditScope::EmployeeList
+    ));
+}
+
+#[test]
+fn test_authorize_auditor_after_expiry_commitment_verification_fails_and_rolls_back_event() {
+    let (env, contract_id) = setup();
+    let client = AuditModuleClient::new(&env, &contract_id);
+
+    let auditor = soroban_sdk::Address::generate(&env);
+    let seq = env.ledger().sequence();
+    let expiration = seq + 100;
+    client.generate_view_key(&auditor, &expiration);
+
+    let amount: i128 = 42_000;
+    let blinding = BytesN::from_array(&env, &[0x33; 32]);
+    let stored = make_commitment(&env, amount, &blinding);
+
+    // One ledger past expiration — the grant must now be treated as expired.
+    env.ledger().set_sequence_number(expiration + 1);
+
+    let result = client.try_verify_commitment_with_key(
+        &auditor,
+        &stored,
+        &amount,
+        &blinding,
+        &AuditScope::EmployeeList,
+    );
+    assert_eq!(result.unwrap_err().unwrap(), AuditError::KeyExpired);
+
+    // NOTE — genuine finding, not a test artifact: `authorize_auditor`
+    // (contracts/audit_module/src/lib.rs) calls
+    // `env.events().publish((Symbol::new(env, "AuditAccessExpired"), ...), ...)`
+    // immediately before returning `Err(AuditError::KeyExpired)`. But Soroban
+    // rolls back *all* effects of an invocation that returns a typed
+    // `contracterror` — the same atomicity guarantee that reverts storage
+    // writes also discards any events published earlier in that same call.
+    // So `AuditAccessExpired` is dead telemetry today: it is never actually
+    // observable by off-chain compliance/monitoring tooling, because it can
+    // only ever be published on a code path that always ends in a rolled-back
+    // error return. This mirrors the exact reason `proof_verifier`'s
+    // `verify_with_reference` deliberately returns `Ok(false)` instead of an
+    // `Err` on expiry (see docs/security/proof-reference-expiry.md) — that
+    // design keeps its result (and any accompanying event) observable.
+    // `authorize_auditor` does not follow that convention, so its expiry
+    // event never reaches an observer. This is a real behavior gap worth its
+    // own fix (e.g. switching the expiry check to a non-erroring path before
+    // emitting), but changing the error/return contract of five public entry
+    // points (`verify_commitment_with_key`, `verify_commitment_with_view_key`,
+    // `generate_aggregate_report`, `export_audit_summary`,
+    // `verify_payroll_metadata`) is a larger, separate change than the test
+    // coverage this issue asks for, so it is flagged here rather than fixed.
+    //
+    // What *is* verified below: no event of any kind — and in particular
+    // nothing containing the claimed salary amount or blinding factor
+    // supplied to this failed request — ever reaches an observer for a
+    // rejected (expired) audit request.
+    assert_eq!(event_count(&env), 0);
+}
+
+// ---------------------------------------------------------------------------
+// Audit Reference Attachment Validation Tests (Issue #389)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_is_valid_proof_reference_rejects_zero_hash() {
+    let env = Env::default();
+    let zero_hash = soroban_sdk::BytesN::from_array(&env, &[0u8; 32]);
+    
+    // The validation function should reject zero hashes
+    assert!(!challenge::is_valid_proof_reference(&env, &zero_hash));
+}
+
+#[test]
+fn test_is_valid_proof_reference_accepts_non_zero_hash() {
+    let env = Env::default();
+    let valid_hash = soroban_sdk::BytesN::from_array(&env, &[1u8; 32]);
+    
+    // The validation function should accept non-zero hashes
+    assert!(challenge::is_valid_proof_reference(&env, &valid_hash));
+}
+
+#[test]
+fn test_validate_audit_reference_attachment_accepts_valid_hash() {
+    let env = Env::default();
+    let valid_hash = soroban_sdk::BytesN::from_array(&env, &[1u8; 32]);
+    
+    // The enhanced validation should accept valid hashes
+    let result = challenge::validate_audit_reference_attachment(&env, &valid_hash);
+    assert!(result.is_ok());
+}
+
+#[test]
+fn test_validate_audit_reference_attachment_rejects_zero_hash() {
+    let env = Env::default();
+    let zero_hash = soroban_sdk::BytesN::from_array(&env, &[0u8; 32]);
+    
+    // The enhanced validation should reject zero hashes with proper error
+    let result = challenge::validate_audit_reference_attachment(&env, &zero_hash);
+    assert!(result.is_err());
+    assert_eq!(result.unwrap_err(), AuditError::InvalidProofReference);
+}
+
+#[test]
+fn test_validate_audit_reference_attachment_rejects_all_zeros() {
+    let env = Env::default();
+    let all_zeros = soroban_sdk::BytesN::from_array(&env, &[0u8; 32]);
+    
+    // The enhanced validation should reject all-zero hashes
+    let result = challenge::validate_audit_reference_attachment(&env, &all_zeros);
+    assert!(result.is_err());
+    assert_eq!(result.unwrap_err(), AuditError::InvalidProofReference);
+}
+
+#[test]
+fn test_validate_audit_reference_accepts_various_valid_hashes() {
+    let env = Env::default();
+    
+    // Test with different valid hash patterns
+    let hash1 = soroban_sdk::BytesN::from_array(&env, &[1u8; 32]);
+    let hash2 = soroban_sdk::BytesN::from_array(&env, &[0xFFu8; 32]);
+    let hash3 = soroban_sdk::BytesN::from_array(&env, &[0xABu8; 32]);
+    
+    // All valid hashes should pass validation
+    assert!(challenge::validate_audit_reference_attachment(&env, &hash1).is_ok());
+    assert!(challenge::validate_audit_reference_attachment(&env, &hash2).is_ok());
+    assert!(challenge::validate_audit_reference_attachment(&env, &hash3).is_ok());
+}
+
+#[test]
+fn test_prune_expired_view_key_before_grace_period_fails() {
+    let (env, contract_id) = setup();
+    let client = AuditModuleClient::new(&env, &contract_id);
+
+    let auditor = soroban_sdk::Address::generate(&env);
+    let admin = contract_id.clone();
+    let seq = env.ledger().sequence();
+    let expiration = seq + 100;
+    let retention: u32 = 50;
+    client.generate_view_key(&auditor, &expiration);
+
+    // One ledger before the grace period elapses: still within retention,
+    // pruning must be rejected so the record remains available.
+    env.ledger().set_sequence_number(expiration + retention - 1);
+    let result = client.try_prune_expired_view_key(&admin, &auditor, &retention);
+    assert_eq!(result.unwrap_err().unwrap(), AuditError::KeyExpired);
+
+    // The record must still be readable — pruning did not happen.
+    assert!(client.try_get_view_key(&auditor).is_ok());
+}
+
+#[test]
+fn test_prune_expired_view_key_at_grace_period_boundary_succeeds() {
+    let (env, contract_id) = setup();
+    let client = AuditModuleClient::new(&env, &contract_id);
+
+    let auditor = soroban_sdk::Address::generate(&env);
+    let admin = contract_id.clone();
+    let seq = env.ledger().sequence();
+    let expiration = seq + 100;
+    let retention: u32 = 50;
+    client.generate_view_key(&auditor, &expiration);
+
+    // Exactly at expiration + retention: the grace period has fully
+    // elapsed, so pruning must now succeed.
+    env.ledger().set_sequence_number(expiration + retention);
+    client.prune_expired_view_key(&admin, &auditor, &retention);
+
+    assert!(client.try_get_view_key(&auditor).is_err());
+    assert!(!client.verify_access(&auditor));
+}
+
+#[test]
+fn test_prune_expired_view_key_before_expiry_fails() {
+    let (env, contract_id) = setup();
+    let client = AuditModuleClient::new(&env, &contract_id);
+
+    let auditor = soroban_sdk::Address::generate(&env);
+    let admin = contract_id.clone();
+    let seq = env.ledger().sequence();
+    let expiration = seq + 100;
+    client.generate_view_key(&auditor, &expiration);
+
+    // Grant is still active — pruning an unexpired grant must be rejected
+    // even with a zero retention window.
+    env.ledger().set_sequence_number(expiration);
+    let result = client.try_prune_expired_view_key(&admin, &auditor, &0);
+    assert_eq!(result.unwrap_err().unwrap(), AuditError::KeyExpired);
+    assert!(client.try_get_view_key(&auditor).is_ok());
 }
